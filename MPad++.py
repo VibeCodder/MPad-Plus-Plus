@@ -105,7 +105,6 @@ class Editor(QTextEdit):
         font = QFont(self.settings["font_family"], self.settings["font_size"])
         self.setFont(font)
         
-        # Usunięto background-color z code, aby Qt użył domyślnego jasnego tła, które łatwo wykryć
         css = f"""
             body {{ color: {self.settings['editor_text']}; font-family: '{self.settings['font_family']}'; font-size: {self.settings['font_size']}pt; }}
             h1 {{ color: {self.settings['h1']}; font-size: {self.settings.get('h1_size', 24)}pt; }}
@@ -114,7 +113,7 @@ class Editor(QTextEdit):
             h4 {{ color: {self.settings['h4']}; font-size: {self.settings.get('h4_size', 16)}pt; }}
             h5 {{ color: {self.settings['h5']}; font-size: {self.settings.get('h5_size', 14)}pt; }}
             h6 {{ color: {self.settings['h6']}; font-size: {self.settings.get('h6_size', 13)}pt; }}
-            code {{ color: {self.settings['code']}; }}
+            code {{ color: {self.settings['code']}; background-color: {self.settings['code_bg']}; }}
             a {{ color: {self.settings['link']}; }}
             blockquote {{ color: {self.settings['quote']}; }}
         """
@@ -332,30 +331,49 @@ class Editor(QTextEdit):
                 
             block_fmt = block.blockFormat()
             
-            # 3. Detect Code blocks (Qt applies a background to code blocks)
+            # 3. Detect Code blocks
+            # Strategy: Qt marks fenced code blocks by giving EVERY fragment in the block
+            # a monospace font (Courier New / monospace) and/or a code background.
+            # Inline `code` spans only affect some fragments.  We require ALL non-empty
+            # fragments to be monospace before treating the whole block as a code block.
             is_code_block = False
+
+            # Check block-level background first (Qt sometimes sets it here)
             if block_fmt.hasProperty(QTextFormat.BackgroundBrush):
-                is_code_block = True
-                # Clear background so our WYSIWYG background can take over
+                bg = block_fmt.background().color()
+                editor_bg = QColor(self.settings['editor_bg'])
+                if bg.isValid() and bg != Qt.transparent and bg != editor_bg:
+                    is_code_block = True
+
+            if not is_code_block:
+                frags_total = 0
+                frags_code = 0
+                it = block.begin()
+                while not it.atEnd():
+                    frag = it.fragment()
+                    if frag.isValid() and frag.length() > 0:
+                        frags_total += 1
+                        f_fmt = frag.charFormat()
+                        # Background signal
+                        frag_bg = f_fmt.background().color() if f_fmt.hasProperty(QTextFormat.BackgroundBrush) else QColor(Qt.transparent)
+                        editor_bg = QColor(self.settings['editor_bg'])
+                        if frag_bg.isValid() and frag_bg != Qt.transparent and frag_bg != editor_bg:
+                            frags_code += 1
+                        else:
+                            # Monospace font signal
+                            fam_list = f_fmt.fontFamilies()
+                            fam = fam_list[0].lower() if fam_list else ""
+                            if fam and ("courier" in fam or "mono" in fam or "consolas" in fam):
+                                frags_code += 1
+                    it += 1
+                # Treat as block code only when every fragment looks like code
+                if frags_total > 0 and frags_total == frags_code:
+                    is_code_block = True
+
+            # Clear any block-level background Qt set; we manage it ourselves via BLOCK_CODE_PROP
+            if is_code_block and block_fmt.hasProperty(QTextFormat.BackgroundBrush):
                 block_fmt.clearBackground()
                 temp_cursor.setBlockFormat(block_fmt)
-                
-            # Also check for monospace font just in case
-            if not is_code_block:
-                b_char_fmt = block.charFormat()
-                fam_list = b_char_fmt.fontFamilies()
-                if b_char_fmt.fontFixedPitch() or (fam_list and "mono" in fam_list[0].lower()):
-                    is_code_block = True
-                if not is_code_block and block.length() > 0:
-                    it = block.begin()
-                    while not it.atEnd():
-                        frag = it.fragment()
-                        if frag.isValid() and frag.length() > 0:
-                            f_fmt = frag.charFormat()
-                            fam_list_f = f_fmt.fontFamilies()
-                            if f_fmt.fontFixedPitch() or (fam_list_f and "mono" in fam_list_f[0].lower()):
-                                is_code_block = True
-                            break # Only check first fragment for performance
 
             if is_code_block:
                 if not (block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True):
@@ -393,26 +411,6 @@ class Editor(QTextEdit):
             is_quote = block_fmt.hasProperty(QUOTE_PROP) and block_fmt.property(QUOTE_PROP) == True
             is_block_code = block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True
             
-            # Secondary code block check (for files loaded before post_process)
-            if not is_block_code:
-                b_char_fmt = block.charFormat()
-                fam_list_b = b_char_fmt.fontFamilies()
-                if b_char_fmt.fontFixedPitch() or (fam_list_b and "mono" in fam_list_b[0].lower()):
-                    is_block_code = True
-                if not is_block_code and block.length() > 0:
-                    it = block.begin()
-                    while not it.atEnd():
-                        frag = it.fragment()
-                        if frag.isValid() and frag.length() > 0:
-                            f_fmt = frag.charFormat()
-                            fam_list_f = f_fmt.fontFamilies()
-                            if f_fmt.fontFixedPitch() or (fam_list_f and "mono" in fam_list_f[0].lower()):
-                                is_block_code = True
-                            break
-                if is_block_code:
-                    block_fmt.setProperty(BLOCK_CODE_PROP, True)
-                    block_updates.append((block.position(), QTextBlockFormat(block_fmt)))
-            
             if is_block_code:
                 # Check if background needs updating
                 current_bg = block_fmt.background().color() if block_fmt.hasProperty(QTextFormat.BackgroundBrush) else QColor(Qt.transparent)
@@ -437,7 +435,7 @@ class Editor(QTextEdit):
                     fam_list = fmt.fontFamilies()
                     fam = fam_list[0] if fam_list else ""
                     if not is_code and fam:
-                        if "mono" in fam.lower() or "consolas" in fam.lower():
+                        if "mono" in fam.lower() or "consolas" in fam.lower() or "courier" in fam.lower():
                             is_code = True
                             fmt.setProperty(CODE_PROP, True)
                             
@@ -450,6 +448,12 @@ class Editor(QTextEdit):
                         fmt.setForeground(QColor(self.settings['code']))
                         fmt.setFontFamilies(["Consolas"])
                         fmt.setProperty(CODE_PROP, True)
+                        # For block code, fragments should be transparent so block background shows
+                        # For inline code, fragments should have the background
+                        if is_block_code:
+                            fmt.setBackground(Qt.transparent)
+                        else:
+                            fmt.setBackground(QColor(self.settings['code_bg']))
                         changed = True
                     elif is_anchor:
                         fmt.setForeground(QColor(self.settings['link']))
@@ -505,44 +509,6 @@ class Editor(QTextEdit):
                 cursor.setPosition(table.lastPosition() + 1, QTextCursor.MoveAnchor)
             else:
                 if not cursor.movePosition(QTextCursor.NextBlock): break
-
-    def keyPressEvent(self, event):
-        cursor = self.textCursor()
-        block_fmt = cursor.blockFormat()
-        is_code_block = block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True
-
-        if is_code_block and event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
-            current_line_empty = (cursor.block().text() == "")
-
-            if current_line_empty:
-                # Puste Enter na końcu bloku kodu -> wyjdź z formatowania kodu
-                cursor.beginEditBlock()
-                new_block_fmt = QTextBlockFormat()
-                new_char_fmt = QTextCharFormat()
-                new_char_fmt.setForeground(QColor(self.settings['editor_text']))
-                new_char_fmt.setFontFamilies([self.settings['font_family']])
-                new_char_fmt.setProperty(CODE_PROP, False)
-                cursor.setBlockFormat(new_block_fmt)
-                cursor.setCharFormat(new_char_fmt)
-                cursor.endEditBlock()
-                self.setTextCursor(cursor)
-                self.window().update_toolbar_state()
-                return
-            else:
-                # Kontynuuj blok kodu w nowej linii, zachowując formatowanie
-                cursor.beginEditBlock()
-                code_block_fmt = QTextBlockFormat(block_fmt)
-                code_char_fmt = QTextCharFormat()
-                code_char_fmt.setForeground(QColor(self.settings['code']))
-                code_char_fmt.setFontFamilies(["Consolas"])
-                code_char_fmt.setProperty(CODE_PROP, True)
-                cursor.insertBlock(code_block_fmt)
-                cursor.setCharFormat(code_char_fmt)
-                cursor.endEditBlock()
-                self.setTextCursor(cursor)
-                return
-
-        super().keyPressEvent(event)
 
     def apply_table_style(self, table):
         rows = table.rows()
@@ -969,7 +935,6 @@ class MainWindow(QMainWindow):
         editor = Editor(self.settings, self)
         index = self.tab_widget.addTab(editor, "New")
         editor.selectionChanged.connect(self.update_toolbar_state)
-        editor.cursorPositionChanged.connect(self.update_toolbar_state)
         if switch:
             self.tab_widget.setCurrentIndex(index)
         return editor
@@ -1174,43 +1139,55 @@ class MainWindow(QMainWindow):
 
     # --- File Operations ---
     def preprocess_markdown(self, content):
-        # Wymusza puste linie między blokami, aby Qt nie zlepiał cytatu i linku
         lines = content.split('\n')
         new_lines = []
         prev_type = 'normal'
         in_md_code_block = False
-        
+
         for line in lines:
             stripped = line.lstrip()
-            current_type = 'normal'
-            
+
             if in_md_code_block:
-                current_type = 'code'
+                # We are inside a fenced code block; check for closing fence
                 if stripped.startswith('```'):
                     in_md_code_block = False
+                    # closing fence is still part of the code block — type stays 'code'
+                    new_lines.append(line)
+                    prev_type = 'code'
+                else:
+                    # Regular line inside code block — no blank-line insertion
+                    new_lines.append(line)
+                    prev_type = 'code'
+                continue
+
+            # Not inside a code block — determine current line type
+            if stripped.startswith('```'):
+                current_type = 'code'
+                in_md_code_block = True
+            elif stripped.startswith('> '):
+                current_type = 'quote'
+            elif stripped.startswith('#'):
+                current_type = 'header'
+            elif stripped.startswith(('- ', '* ', '• ')) or (
+                    len(stripped) > 2 and stripped[0].isdigit()
+                    and stripped[1] == '.' and stripped[2] == ' '):
+                current_type = 'list'
             else:
-                if stripped.startswith('```'):
-                    current_type = 'code'
-                    in_md_code_block = True
-                elif stripped.startswith('> '):
-                    current_type = 'quote'
-                elif stripped.startswith('#'):
-                    current_type = 'header'
-                elif stripped.startswith(('- ', '* ', '• ')) or (len(stripped)>2 and stripped[0].isdigit() and stripped[1]=='.' and stripped[2]==' '):
-                    current_type = 'list'
-                    
-            # Zawsze dodawaj pustą linię, jeśli typ bloku się zmienia na/z 'quote' lub 'header'
+                current_type = 'normal'
+
+            # Insert a blank separator line when switching between
+            # quote/header and other types (only outside code blocks)
             if current_type != prev_type:
-                if current_type in ['quote', 'header'] or prev_type in ['quote', 'header']:
+                if current_type in ('quote', 'header') or prev_type in ('quote', 'header'):
                     if new_lines and new_lines[-1].strip() != '':
                         new_lines.append('')
-                        
+
             new_lines.append(line)
             if line.strip() == '':
                 prev_type = 'normal'
             else:
                 prev_type = current_type
-                
+
         return '\n'.join(new_lines)
 
     def open_file_dialog(self, in_new_tab=False):
@@ -1241,14 +1218,12 @@ class MainWindow(QMainWindow):
                 content = f.read()
             content = self.preprocess_markdown(content)
             
-            # Usunięto blockSignals, które powodowało zawieszanie kursora
-            editor.setMarkdown(content)
+            editor.document().setMarkdown(content, QTextDocument.MarkdownDialectGitHub)
             editor.current_file = file_path
             editor.post_process_markdown()
             editor.style_tables()
             editor.apply_settings_to_document()
             
-            # Ręcznie przywróć stan po wczytaniu
             cursor = QTextCursor(editor.document())
             cursor.movePosition(QTextCursor.Start)
             editor.setTextCursor(cursor)
@@ -1401,12 +1376,14 @@ class MainWindow(QMainWindow):
                     new_char_fmt.setForeground(QColor(self.settings['editor_text']))
                     new_char_fmt.setFontFamilies([self.settings['font_family']])
                     new_char_fmt.setProperty(CODE_PROP, False)
+                    new_char_fmt.setBackground(Qt.transparent)
                 else:
                     new_block_fmt.setProperty(BLOCK_CODE_PROP, True)
                     new_block_fmt.setBackground(QColor(self.settings['code_bg']))
                     new_char_fmt.setForeground(QColor(self.settings['code']))
                     new_char_fmt.setFontFamilies(["Consolas"])
                     new_char_fmt.setProperty(CODE_PROP, True)
+                    new_char_fmt.setBackground(Qt.transparent) # Let block background show
                     
                 cursor.setBlockFormat(new_block_fmt)
                 cursor.mergeCharFormat(new_char_fmt)
