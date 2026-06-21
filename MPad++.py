@@ -148,21 +148,37 @@ class Editor(QTextEdit):
         
         block = self.document().firstBlock()
         viewport_height = self.viewport().height()
-        
+
+        def is_quote_block(b):
+            return (b.isValid() and b.isVisible()
+                    and b.blockFormat().hasProperty(QUOTE_PROP)
+                    and b.blockFormat().property(QUOTE_PROP) == True)
+
         while block.isValid():
-            rect = self.document().documentLayout().blockBoundingRect(block)
-            top = int(rect.top() - self.verticalScrollBar().value())
-            bottom = int(rect.bottom() - self.verticalScrollBar().value())
-            
-            if top > viewport_height:
-                break
-                
-            if block.isVisible() and block.blockFormat().hasProperty(QUOTE_PROP) and block.blockFormat().property(QUOTE_PROP) == True:
-                if bottom > 0:
-                    x = max(2, line_width // 2)
-                    painter.drawLine(x, top, x, bottom)
-                    
-            block = block.next()
+            if not is_quote_block(block):
+                block = block.next()
+                continue
+
+            # Found start of a quote group — scan forward to find the end
+            group_start = block
+            group_end = block
+            nxt = block.next()
+            while is_quote_block(nxt):
+                group_end = nxt
+                nxt = nxt.next()
+
+            # Calculate pixel span of the whole group
+            start_rect = self.document().documentLayout().blockBoundingRect(group_start)
+            end_rect   = self.document().documentLayout().blockBoundingRect(group_end)
+            top    = int(start_rect.top()    - self.verticalScrollBar().value())
+            bottom = int(end_rect.bottom()   - self.verticalScrollBar().value())
+
+            if bottom > 0 and top < viewport_height:
+                x = max(2, line_width // 2)
+                painter.drawLine(x, top, x, bottom)
+
+            # Advance past the whole group
+            block = nxt
 
     def highlight_current_line(self):
         extra_selections = []
@@ -285,6 +301,54 @@ class Editor(QTextEdit):
         else:
             super().dragEnterEvent(event)
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            cursor = self.textCursor()
+            block = cursor.block()
+            block_fmt = block.blockFormat()
+            is_quote = (block_fmt.hasProperty(QUOTE_PROP)
+                        and block_fmt.property(QUOTE_PROP) == True)
+
+            if is_quote:
+                # If the current line is empty → exit quote mode
+                if block.text().strip() == '':
+                    # Remove quote formatting from this empty block and insert newline
+                    cursor.beginEditBlock()
+                    new_fmt = QTextBlockFormat(block_fmt)
+                    new_fmt.setProperty(QUOTE_PROP, False)
+                    new_fmt.setLeftMargin(0)
+                    cursor.setBlockFormat(new_fmt)
+                    new_char = QTextCharFormat()
+                    new_char.setFontItalic(False)
+                    new_char.setForeground(QColor(self.settings['editor_text']))
+                    new_char.setProperty(CODE_PROP, False)
+                    cursor.select(QTextCursor.BlockUnderCursor)
+                    cursor.mergeCharFormat(new_char)
+                    cursor.clearSelection()
+                    cursor.endEditBlock()
+                    self.setTextCursor(cursor)
+                    self.window().update_toolbar_state()
+                    return  # don't insert another newline
+                else:
+                    # Continue the quote on the new line
+                    cursor.beginEditBlock()
+                    cursor.insertBlock()
+                    # Apply quote block format to the new block
+                    new_block_fmt = QTextBlockFormat(block_fmt)
+                    cursor.setBlockFormat(new_block_fmt)
+                    # Apply quote char format
+                    new_char = QTextCharFormat()
+                    new_char.setFontItalic(True)
+                    new_char.setForeground(QColor(self.settings['quote']))
+                    new_char.setProperty(CODE_PROP, False)
+                    cursor.setCharFormat(new_char)
+                    cursor.endEditBlock()
+                    self.setTextCursor(cursor)
+                    self.window().update_toolbar_state()
+                    return
+
+        super().keyPressEvent(event)
+
     def dropEvent(self, event: QDropEvent):
         if event.mimeData().hasUrls():
             url = event.mimeData().urls()[0]
@@ -394,7 +458,7 @@ class Editor(QTextEdit):
             
         cursor.endEditBlock()
         
-    def apply_settings_to_document(self):
+    def apply_settings_to_document(self, restore_cursor=True):
         orig_cursor = self.textCursor()
         char_updates = []
         block_updates = []
@@ -495,8 +559,9 @@ class Editor(QTextEdit):
             cur.setPosition(pos + length, QTextCursor.KeepAnchor)
             cur.setCharFormat(fmt)
         cur.endEditBlock()
-        
-        self.setTextCursor(orig_cursor)
+
+        if restore_cursor:
+            self.setTextCursor(orig_cursor)
         self.highlight_current_line()
 
     def style_tables(self):
@@ -1222,7 +1287,7 @@ class MainWindow(QMainWindow):
             editor.current_file = file_path
             editor.post_process_markdown()
             editor.style_tables()
-            editor.apply_settings_to_document()
+            editor.apply_settings_to_document(restore_cursor=False)
             
             cursor = QTextCursor(editor.document())
             cursor.movePosition(QTextCursor.Start)
