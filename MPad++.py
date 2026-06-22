@@ -12,7 +12,7 @@ from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListF
                            QKeySequence, QShortcut, QFont, 
                            QAction, QTextCursor, QDragEnterEvent, QDropEvent, 
                            QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon)
-from PySide6.QtCore import QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect
+from PySide6.QtCore import QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect, QTimer
 
 # --- Default settings ---
 DEFAULT_SETTINGS = {
@@ -308,11 +308,12 @@ class Editor(QTextEdit):
             block_fmt = block.blockFormat()
             is_quote = (block_fmt.hasProperty(QUOTE_PROP)
                         and block_fmt.property(QUOTE_PROP) == True)
+            is_block_code = (block_fmt.hasProperty(BLOCK_CODE_PROP)
+                             and block_fmt.property(BLOCK_CODE_PROP) == True)
 
             if is_quote:
                 # If the current line is empty → exit quote mode
                 if block.text().strip() == '':
-                    # Remove quote formatting from this empty block and insert newline
                     cursor.beginEditBlock()
                     new_fmt = QTextBlockFormat(block_fmt)
                     new_fmt.setProperty(QUOTE_PROP, False)
@@ -328,19 +329,54 @@ class Editor(QTextEdit):
                     cursor.endEditBlock()
                     self.setTextCursor(cursor)
                     self.window().update_toolbar_state()
-                    return  # don't insert another newline
+                    return
                 else:
                     # Continue the quote on the new line
                     cursor.beginEditBlock()
                     cursor.insertBlock()
-                    # Apply quote block format to the new block
                     new_block_fmt = QTextBlockFormat(block_fmt)
                     cursor.setBlockFormat(new_block_fmt)
-                    # Apply quote char format
                     new_char = QTextCharFormat()
                     new_char.setFontItalic(True)
                     new_char.setForeground(QColor(self.settings['quote']))
                     new_char.setProperty(CODE_PROP, False)
+                    cursor.setCharFormat(new_char)
+                    cursor.endEditBlock()
+                    self.setTextCursor(cursor)
+                    self.window().update_toolbar_state()
+                    return
+
+            elif is_block_code:
+                # If the current line is empty → exit code block mode
+                if block.text().strip() == '':
+                    cursor.beginEditBlock()
+                    new_fmt = QTextBlockFormat(block_fmt)
+                    new_fmt.setProperty(BLOCK_CODE_PROP, False)
+                    new_fmt.setBackground(Qt.transparent)
+                    cursor.setBlockFormat(new_fmt)
+                    new_char = QTextCharFormat()
+                    new_char.setForeground(QColor(self.settings['editor_text']))
+                    new_char.setFontFamilies([self.settings['font_family']])
+                    new_char.setProperty(CODE_PROP, False)
+                    new_char.setBackground(Qt.transparent)
+                    cursor.select(QTextCursor.BlockUnderCursor)
+                    cursor.mergeCharFormat(new_char)
+                    cursor.clearSelection()
+                    cursor.endEditBlock()
+                    self.setTextCursor(cursor)
+                    self.window().update_toolbar_state()
+                    return
+                else:
+                    # Continue code block on the new line
+                    cursor.beginEditBlock()
+                    cursor.insertBlock()
+                    new_block_fmt = QTextBlockFormat(block_fmt)
+                    cursor.setBlockFormat(new_block_fmt)
+                    new_char = QTextCharFormat()
+                    new_char.setForeground(QColor(self.settings['code']))
+                    new_char.setFontFamilies(["Consolas"])
+                    new_char.setProperty(CODE_PROP, True)
+                    new_char.setBackground(Qt.transparent)
                     cursor.setCharFormat(new_char)
                     cursor.endEditBlock()
                     self.setTextCursor(cursor)
@@ -562,7 +598,7 @@ class Editor(QTextEdit):
 
         if restore_cursor:
             self.setTextCursor(orig_cursor)
-        self.highlight_current_line()
+            self.highlight_current_line()
 
     def style_tables(self):
         cursor = QTextCursor(self.document())
@@ -1282,19 +1318,47 @@ class MainWindow(QMainWindow):
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             content = self.preprocess_markdown(content)
-            
+
+            # Disconnect cursor signals temporarily so our formatting passes
+            # (post_process / style_tables / apply_settings) cannot accidentally
+            # move the visible cursor via cursorPositionChanged side-effects.
+            try:
+                editor.cursorPositionChanged.disconnect(editor.highlight_current_line)
+                editor.cursorPositionChanged.disconnect(editor.line_number_area.update)
+            except RuntimeError:
+                pass
+
             editor.document().setMarkdown(content, QTextDocument.MarkdownDialectGitHub)
             editor.current_file = file_path
             editor.post_process_markdown()
             editor.style_tables()
             editor.apply_settings_to_document(restore_cursor=False)
-            
-            cursor = QTextCursor(editor.document())
-            cursor.movePosition(QTextCursor.Start)
-            editor.setTextCursor(cursor)
-            editor.highlight_current_line()
-            editor.setFocus(Qt.OtherFocusReason)
-            
+
+            # Reconnect signals
+            editor.cursorPositionChanged.connect(editor.highlight_current_line)
+            editor.cursorPositionChanged.connect(editor.line_number_area.update)
+
+            # Force document layout to fully recalculate before we position cursor.
+            editor.document().adjustSize()
+
+            def reset_cursor():
+                c = QTextCursor(editor.document())
+                c.movePosition(QTextCursor.Start)
+                editor.setTextCursor(c)
+                editor.setFocus(Qt.OtherFocusReason)
+                editor.highlight_current_line()
+                editor.line_number_area.update()
+                # Second deferred shot in case layout emits anything after adjustSize
+                QTimer.singleShot(0, reset_cursor2)
+
+            def reset_cursor2():
+                c = QTextCursor(editor.document())
+                c.movePosition(QTextCursor.Start)
+                editor.setTextCursor(c)
+                editor.highlight_current_line()
+
+            QTimer.singleShot(0, reset_cursor)
+
             self.update_tab_title(editor)
             self.update_window_title()
             self.update_toolbar_state()
