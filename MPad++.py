@@ -12,7 +12,7 @@ from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListF
                            QKeySequence, QShortcut, QFont, 
                            QAction, QTextCursor, QDragEnterEvent, QDropEvent, 
                            QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon)
-from PySide6.QtCore import QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect, QTimer
+from PySide6.QtCore import QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect
 
 # --- Default settings ---
 DEFAULT_SETTINGS = {
@@ -141,11 +141,12 @@ class Editor(QTextEdit):
     def paintEvent(self, event):
         super().paintEvent(event)
         
+        # Draw quote bars AFTER text (as overlay layer)
         painter = QPainter(self.viewport())
         line_width = self.settings.get('quote_line_width', 3)
-        line_color = QColor(self.settings.get('quote_line_color', '#5c5c5c'))
-        painter.setPen(QPen(line_color, line_width))
-        
+        line_qcolor = QColor(self.settings.get('quote_line_color', '#5c5c5c'))
+        painter.setPen(QPen(line_qcolor, line_width))
+
         block = self.document().firstBlock()
         viewport_height = self.viewport().height()
 
@@ -158,27 +159,21 @@ class Editor(QTextEdit):
             if not is_quote_block(block):
                 block = block.next()
                 continue
-
-            # Found start of a quote group — scan forward to find the end
             group_start = block
-            group_end = block
+            group_end   = block
             nxt = block.next()
             while is_quote_block(nxt):
                 group_end = nxt
                 nxt = nxt.next()
-
-            # Calculate pixel span of the whole group
             start_rect = self.document().documentLayout().blockBoundingRect(group_start)
             end_rect   = self.document().documentLayout().blockBoundingRect(group_end)
             top    = int(start_rect.top()    - self.verticalScrollBar().value())
             bottom = int(end_rect.bottom()   - self.verticalScrollBar().value())
-
             if bottom > 0 and top < viewport_height:
                 x = max(2, line_width // 2)
                 painter.drawLine(x, top, x, bottom)
-
-            # Advance past the whole group
             block = nxt
+        painter.end()
 
     def highlight_current_line(self):
         extra_selections = []
@@ -312,7 +307,6 @@ class Editor(QTextEdit):
                              and block_fmt.property(BLOCK_CODE_PROP) == True)
 
             if is_quote:
-                # If the current line is empty → exit quote mode
                 if block.text().strip() == '':
                     cursor.beginEditBlock()
                     new_fmt = QTextBlockFormat(block_fmt)
@@ -331,7 +325,6 @@ class Editor(QTextEdit):
                     self.window().update_toolbar_state()
                     return
                 else:
-                    # Continue the quote on the new line
                     cursor.beginEditBlock()
                     cursor.insertBlock()
                     new_block_fmt = QTextBlockFormat(block_fmt)
@@ -347,7 +340,6 @@ class Editor(QTextEdit):
                     return
 
             elif is_block_code:
-                # If the current line is empty → exit code block mode
                 if block.text().strip() == '':
                     cursor.beginEditBlock()
                     new_fmt = QTextBlockFormat(block_fmt)
@@ -367,7 +359,6 @@ class Editor(QTextEdit):
                     self.window().update_toolbar_state()
                     return
                 else:
-                    # Continue code block on the new line
                     cursor.beginEditBlock()
                     cursor.insertBlock()
                     new_block_fmt = QTextBlockFormat(block_fmt)
@@ -408,7 +399,6 @@ class Editor(QTextEdit):
                 block = next_block
                 continue
             
-            # 1. Convert QTextList to our prefix lists
             text_list = temp_cursor.currentList()
             is_list = text_list is not None
             if is_list:
@@ -431,14 +421,7 @@ class Editor(QTextEdit):
                 
             block_fmt = block.blockFormat()
             
-            # 3. Detect Code blocks
-            # Strategy: Qt marks fenced code blocks by giving EVERY fragment in the block
-            # a monospace font (Courier New / monospace) and/or a code background.
-            # Inline `code` spans only affect some fragments.  We require ALL non-empty
-            # fragments to be monospace before treating the whole block as a code block.
             is_code_block = False
-
-            # Check block-level background first (Qt sometimes sets it here)
             if block_fmt.hasProperty(QTextFormat.BackgroundBrush):
                 bg = block_fmt.background().color()
                 editor_bg = QColor(self.settings['editor_bg'])
@@ -454,23 +437,19 @@ class Editor(QTextEdit):
                     if frag.isValid() and frag.length() > 0:
                         frags_total += 1
                         f_fmt = frag.charFormat()
-                        # Background signal
                         frag_bg = f_fmt.background().color() if f_fmt.hasProperty(QTextFormat.BackgroundBrush) else QColor(Qt.transparent)
                         editor_bg = QColor(self.settings['editor_bg'])
                         if frag_bg.isValid() and frag_bg != Qt.transparent and frag_bg != editor_bg:
                             frags_code += 1
                         else:
-                            # Monospace font signal
                             fam_list = f_fmt.fontFamilies()
                             fam = fam_list[0].lower() if fam_list else ""
                             if fam and ("courier" in fam or "mono" in fam or "consolas" in fam):
                                 frags_code += 1
                     it += 1
-                # Treat as block code only when every fragment looks like code
                 if frags_total > 0 and frags_total == frags_code:
                     is_code_block = True
 
-            # Clear any block-level background Qt set; we manage it ourselves via BLOCK_CODE_PROP
             if is_code_block and block_fmt.hasProperty(QTextFormat.BackgroundBrush):
                 block_fmt.clearBackground()
                 temp_cursor.setBlockFormat(block_fmt)
@@ -480,7 +459,6 @@ class Editor(QTextEdit):
                     block_fmt.setProperty(BLOCK_CODE_PROP, True)
                     temp_cursor.setBlockFormat(block_fmt)
             else:
-                # 2. Detect Quote blocks (not list, not code, left margin > 10)
                 if not is_list and block_fmt.leftMargin() > 10:
                     block_fmt.setProperty(QUOTE_PROP, True)
                     block_fmt.setLeftMargin(15)
@@ -512,7 +490,6 @@ class Editor(QTextEdit):
             is_block_code = block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True
             
             if is_block_code:
-                # Check if background needs updating
                 current_bg = block_fmt.background().color() if block_fmt.hasProperty(QTextFormat.BackgroundBrush) else QColor(Qt.transparent)
                 if current_bg != QColor(self.settings['code_bg']):
                     new_block_fmt = QTextBlockFormat(block_fmt)
@@ -548,8 +525,6 @@ class Editor(QTextEdit):
                         fmt.setForeground(QColor(self.settings['code']))
                         fmt.setFontFamilies(["Consolas"])
                         fmt.setProperty(CODE_PROP, True)
-                        # For block code, fragments should be transparent so block background shows
-                        # For inline code, fragments should have the background
                         if is_block_code:
                             fmt.setBackground(Qt.transparent)
                         else:
@@ -1036,14 +1011,20 @@ class MainWindow(QMainWindow):
         editor = Editor(self.settings, self)
         index = self.tab_widget.addTab(editor, "New")
         editor.selectionChanged.connect(self.update_toolbar_state)
+        editor.document().modificationChanged.connect(lambda mod, e=editor: self.on_modification_changed(e))
         if switch:
             self.tab_widget.setCurrentIndex(index)
         return editor
 
+    def on_modification_changed(self, editor):
+        self.update_tab_title(editor)
+        if editor == self.tab_widget.currentWidget():
+            self.update_window_title()
+
     def close_tab(self, index):
         editor = self.tab_widget.widget(index)
-        if editor and not editor.document().isEmpty():
-            reply = QMessageBox.question(self, "Close Tab", "The tab is not empty. Are you sure you want to close it?", QMessageBox.Yes | QMessageBox.No)
+        if editor and editor.document().isModified():
+            reply = QMessageBox.question(self, "Close Tab", "The tab has unsaved changes. Are you sure you want to close it?", QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.No: return
         self.tab_widget.removeTab(index)
         if self.tab_widget.count() == 0:
@@ -1081,19 +1062,28 @@ class MainWindow(QMainWindow):
 
     def update_tab_title(self, editor):
         idx = self.tab_widget.indexOf(editor)
+        title = "New"
         if editor.current_file:
-            self.tab_widget.setTabText(idx, os.path.basename(editor.current_file))
+            title = os.path.basename(editor.current_file)
+        if editor.document().isModified():
+            title = f"*{title}"
+        self.tab_widget.setTabText(idx, title)
+        if editor.current_file:
             self.tab_widget.setTabToolTip(idx, editor.current_file)
         else:
-            self.tab_widget.setTabText(idx, "New")
             self.tab_widget.setTabToolTip(idx, "")
 
     def update_window_title(self):
         editor = self.tab_widget.currentWidget()
-        if editor and editor.current_file:
-            self.setWindowTitle(f"MPad++ - {os.path.basename(editor.current_file)}")
-        else:
+        if not editor:
             self.setWindowTitle("MPad++")
+            return
+        base_title = "New"
+        if editor.current_file:
+            base_title = os.path.basename(editor.current_file)
+        
+        modified_str = "*" if editor.document().isModified() else ""
+        self.setWindowTitle(f"MPad++ - {modified_str}{base_title}")
 
     # --- Custom Markdown Export/Import ---
     def export_markdown(self, editor):
@@ -1249,19 +1239,15 @@ class MainWindow(QMainWindow):
             stripped = line.lstrip()
 
             if in_md_code_block:
-                # We are inside a fenced code block; check for closing fence
                 if stripped.startswith('```'):
                     in_md_code_block = False
-                    # closing fence is still part of the code block — type stays 'code'
                     new_lines.append(line)
                     prev_type = 'code'
                 else:
-                    # Regular line inside code block — no blank-line insertion
                     new_lines.append(line)
                     prev_type = 'code'
                 continue
 
-            # Not inside a code block — determine current line type
             if stripped.startswith('```'):
                 current_type = 'code'
                 in_md_code_block = True
@@ -1276,8 +1262,6 @@ class MainWindow(QMainWindow):
             else:
                 current_type = 'normal'
 
-            # Insert a blank separator line when switching between
-            # quote/header and other types (only outside code blocks)
             if current_type != prev_type:
                 if current_type in ('quote', 'header') or prev_type in ('quote', 'header'):
                     if new_lines and new_lines[-1].strip() != '':
@@ -1319,50 +1303,32 @@ class MainWindow(QMainWindow):
                 content = f.read()
             content = self.preprocess_markdown(content)
 
-            # Disconnect cursor signals temporarily so our formatting passes
-            # (post_process / style_tables / apply_settings) cannot accidentally
-            # move the visible cursor via cursorPositionChanged side-effects.
-            try:
-                editor.cursorPositionChanged.disconnect(editor.highlight_current_line)
-                editor.cursorPositionChanged.disconnect(editor.line_number_area.update)
-            except RuntimeError:
-                pass
-
+            editor.document().setUndoRedoEnabled(False)
+            editor.setExtraSelections([])
             editor.document().setMarkdown(content, QTextDocument.MarkdownDialectGitHub)
             editor.current_file = file_path
             editor.post_process_markdown()
             editor.style_tables()
             editor.apply_settings_to_document(restore_cursor=False)
+            editor.document().setModified(False)
+            editor.document().setUndoRedoEnabled(True)
 
-            # Reconnect signals
-            editor.cursorPositionChanged.connect(editor.highlight_current_line)
-            editor.cursorPositionChanged.connect(editor.line_number_area.update)
-
-            # Force document layout to fully recalculate before we position cursor.
-            editor.document().adjustSize()
-
-            def reset_cursor():
-                c = QTextCursor(editor.document())
-                c.movePosition(QTextCursor.Start)
-                editor.setTextCursor(c)
-                editor.setFocus(Qt.OtherFocusReason)
-                editor.highlight_current_line()
-                editor.line_number_area.update()
-                # Second deferred shot in case layout emits anything after adjustSize
-                QTimer.singleShot(0, reset_cursor2)
-
-            def reset_cursor2():
-                c = QTextCursor(editor.document())
-                c.movePosition(QTextCursor.Start)
-                editor.setTextCursor(c)
-                editor.highlight_current_line()
-
-            QTimer.singleShot(0, reset_cursor)
+            cursor = QTextCursor(editor.document())
+            cursor.movePosition(QTextCursor.Start)
+            editor.setTextCursor(cursor)
+            editor.ensureCursorVisible()
 
             self.update_tab_title(editor)
             self.update_window_title()
             self.update_toolbar_state()
+            
+            editor.window().activateWindow()
+            editor.setFocus(Qt.OtherFocusReason)
+            editor.viewport().update()
+            editor.line_number_area.update()
+
         except Exception as e:
+            editor.document().setUndoRedoEnabled(True)
             QMessageBox.critical(self, "Error", f"Cannot open file:\n{str(e)}")
 
     def save_file(self):
@@ -1375,6 +1341,7 @@ class MainWindow(QMainWindow):
             markdown_content = self.export_markdown(editor)
             with open(editor.current_file, 'w', encoding='utf-8') as f:
                 f.write(markdown_content)
+            editor.document().setModified(False)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Cannot save file:\n{str(e)}")
 
@@ -1393,8 +1360,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         for i in range(self.tab_widget.count()):
             editor = self.tab_widget.widget(i)
-            if editor and not editor.document().isEmpty():
-                reply = QMessageBox.question(self, "Exit", "Some tabs are not empty. Are you sure you want to close the program?", QMessageBox.Yes | QMessageBox.No)
+            if editor and editor.document().isModified():
+                reply = QMessageBox.question(self, "Exit", "Some tabs have unsaved changes. Are you sure you want to close the program?", QMessageBox.Yes | QMessageBox.No)
                 if reply == QMessageBox.No:
                     event.ignore()
                     return
@@ -1512,7 +1479,7 @@ class MainWindow(QMainWindow):
                     new_char_fmt.setForeground(QColor(self.settings['code']))
                     new_char_fmt.setFontFamilies(["Consolas"])
                     new_char_fmt.setProperty(CODE_PROP, True)
-                    new_char_fmt.setBackground(Qt.transparent) # Let block background show
+                    new_char_fmt.setBackground(Qt.transparent)
                     
                 cursor.setBlockFormat(new_block_fmt)
                 cursor.mergeCharFormat(new_char_fmt)
