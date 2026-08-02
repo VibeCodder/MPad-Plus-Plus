@@ -91,6 +91,27 @@ class Editor(QTextEdit):
         self._caret_timer.setInterval(flash_time // 2 if flash_time > 0 else 500)
         self._caret_timer.start()
 
+        # setCursorWidth(0) stops Qt from *drawing* its own cursor, but it
+        # does NOT stop QWidgetTextControl from running its own internal
+        # cursorBlinkTimer (see QWidgetTextControlPrivate::updateCursorBlinking
+        # in Qt's source: it only skips starting that timer when the
+        # application's cursorFlashTime is < 2ms). That internal timer keeps
+        # firing on its own schedule and, every time it does, emits an
+        # updateRequest for a *narrow, cursor-sized rect* (via repaintCursor()
+        # -> cursorRectPlusUnicodeDirectionMarkers) which gets forwarded to a
+        # PARTIAL viewport update - completely independent of, and out of
+        # phase with, our own _caret_timer above. Two consequences of that:
+        # 1) our caret_width-wide fillRect gets clipped down to Qt's much
+        #    narrower internal cursor rect whenever THAT timer's repaint
+        #    fires, so the caret visibly alternates between full width and a
+        #    1px sliver ("flat, then thicker") independent of our own blink.
+        # 2) if that narrow rect is computed just before a scroll/reload and
+        #    only delivered just after, it can invalidate/repaint the wrong
+        #    on-screen location - a second, stale-looking caret.
+        # Setting the app-wide flash time to 0 stops Qt from ever starting
+        # that internal timer, so ours is the only thing driving the blink.
+        QApplication.instance().setCursorFlashTime(0)
+
         self.line_number_area = LineNumberArea(self)
         self.textChanged.connect(self.update_line_number_area_width)
         self.verticalScrollBar().valueChanged.connect(self.line_number_area.update)
@@ -122,26 +143,44 @@ class Editor(QTextEdit):
 
     def _toggle_caret(self):
         self._caret_visible = not self._caret_visible
-        self.viewport().update()
+        # viewport().update() only *schedules* a repaint and lets Qt/the OS
+        # coalesce it with other pending paint messages. On Windows this
+        # coalescing has been observed to occasionally drop or truncate the
+        # scheduled region right after a focus change or document reload,
+        # which is exactly how a "phantom" second caret survives: the old
+        # caret's pixels were never actually part of a paint that ran.
+        # repaint() forces the paint to happen synchronously, right now,
+        # covering the whole viewport, so there is no window in which a
+        # stale caret can be left un-repainted.
+        self.viewport().repaint()
 
     def _reset_caret_blink(self):
         # Make the caret solid-visible immediately after any cursor move or
         # edit (standard caret UX), then let it resume blinking.
         self._caret_visible = True
-        self.viewport().update()
+        self.viewport().repaint()
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
+        # Windows re-syncs Qt's style hints (including cursorFlashTime) from
+        # the system theme at various points after startup (e.g. on the
+        # first show, or WM_SETTINGCHANGE), which can silently overwrite the
+        # 0-override set once in __init__. QWidgetTextControl reads
+        # cursorFlashTime right here, on focus-in, to decide whether to
+        # (re)start its own internal blink timer - so re-assert 0 at this
+        # exact point rather than trusting the earlier one-time override to
+        # have survived.
+        QApplication.instance().setCursorFlashTime(0)
         self._caret_visible = True
         if not self._caret_timer.isActive():
             self._caret_timer.start()
-        self.viewport().update()
+        self.viewport().repaint()
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
         self._caret_timer.stop()
         self._caret_visible = False
-        self.viewport().update()
+        self.viewport().repaint()
 
     def apply_settings(self):
         self.setStyleSheet(f"QTextEdit {{ background-color: {self.settings['editor_bg']}; color: {self.settings['editor_text']}; border: none; }}")
@@ -202,15 +241,25 @@ class Editor(QTextEdit):
         # inside that small strip, but our current-line highlight, quote
         # bars, and hand-drawn caret in paintEvent() below are manual
         # overlays: they get shifted along with the blit like any other
-        # pixel, and if the shifted spot falls outside that small repaint
-        # strip, the old caret is never erased. It just sits there,
-        # frozen, looking like a second/inactive cursor - most noticeable
-        # right after opening a file, since ensureCursorVisible() then
-        # triggers exactly this kind of scroll. Forcing a full-viewport
-        # repaint after every scroll guarantees our overlays are always
-        # redrawn (or correctly omitted) from scratch, never left stale.
-        super().scrollContentsBy(dx, dy)
-        self.viewport().update()
+        # pixel. viewport().scroll() performs that blit (and paints the
+        # newly-exposed strip) synchronously, before a later, merely
+        # *scheduled* full update() ever runs - so the old caret can still
+        # flash into view, or even stay, as a frozen "second cursor" that
+        # then rides along with any further blit (e.g. when lines are
+        # inserted/deleted above it, which also triggers a scroll to keep
+        # the cursor visible). The only reliable fix is to skip Qt's blit
+        # shortcut entirely: don't call the base implementation at all,
+        # just repaint the whole viewport from scratch every time. Qt's
+        # own text painting (called from our paintEvent via
+        # super().paintEvent()) always draws at the *current* scrollbar
+        # offset regardless of whether a blit happened, so this is safe -
+        # it just means every scroll does a full, artifact-free redraw.
+        # Use repaint() rather than update(): update() only schedules the
+        # redraw and lets Qt coalesce/collapse it with other pending paint
+        # messages, which on Windows can end up dropping the repaint for
+        # this specific region - letting a stale caret survive the scroll
+        # instead of being wiped by the full redraw we're asking for here.
+        self.viewport().repaint()
 
     def paintEvent(self, event):
         # Draw current-line highlight as background BEFORE Qt renders text+cursor.
@@ -269,7 +318,15 @@ class Editor(QTextEdit):
         if self.hasFocus() and self._caret_visible and not self.textCursor().hasSelection():
             rect = self.cursorRect()
             caret_painter = QPainter(self.viewport())
-            caret_painter.fillRect(rect.x(), rect.y(), max(1, self.settings.get('caret_width', 2)), rect.height(),
+            # Explicitly force crisp, pixel-aligned, non-antialiased fill.
+            # Without this, on displays with fractional DPI scaling
+            # (125%/150%), the same logical-pixel rect can end up covering a
+            # different number of *device* pixels from one blink to the
+            # next depending on how the fractional edges land, which reads
+            # as the caret's width visibly changing between blinks.
+            caret_painter.setRenderHint(QPainter.Antialiasing, False)
+            caret_width = max(1, int(round(self.settings.get('caret_width', 2))))
+            caret_painter.fillRect(int(rect.x()), int(rect.y()), caret_width, int(rect.height()),
                                     QColor(self.settings['editor_text']))
             caret_painter.end()
 
@@ -388,6 +445,24 @@ class Editor(QTextEdit):
         else:
             super().dragEnterEvent(event)
 
+    def dragMoveEvent(self, event):
+        # QTextEdit's base dragMoveEvent (which we'd otherwise inherit
+        # unchanged) drives QWidgetTextControl's own internal drag-feedback
+        # cursor: a preview insertion-point line that follows the mouse
+        # while dragging over the widget, separate from the real text
+        # cursor. It's drawn as part of Qt's own text rendering inside
+        # super().paintEvent(), and Qt only clears it as part of its own
+        # dropEvent handling. Since dropEvent() below never calls
+        # super().dropEvent() for file URLs (the load is deferred/handled
+        # ourselves instead), that cleanup never runs, and the preview line
+        # is left frozen at wherever the mouse last was - the "dead" ghost
+        # cursor. Skip the base implementation entirely for file drags so
+        # that indicator is never created in the first place.
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             cursor = self.textCursor()
@@ -474,7 +549,22 @@ class Editor(QTextEdit):
             if url.isLocalFile():
                 file_path = url.toLocalFile()
                 if file_path.endswith('.md') or file_path.endswith('.txt'):
-                    self.window().open_file_path(file_path, target_editor=self)
+                    # Accept the drop immediately so the native drag-and-drop
+                    # operation completes cleanly, but defer the actual file
+                    # load. On Windows, the drop is delivered from *inside*
+                    # DoDragDrop's own nested message loop (mouse still
+                    # effectively captured, native DnD feedback still being
+                    # torn down). Doing the heavy work here - setMarkdown(),
+                    # setTextCursor(), setFocus(), and the repaints those
+                    # trigger - runs while that nested loop hasn't unwound
+                    # yet, which is exactly the state where Windows has been
+                    # seen to leave a stale caret behind. Running it a tick
+                    # later, once we're back in normal event processing,
+                    # avoids that context entirely (this mirrors why File >
+                    # Open, which never runs inside that nested loop, has
+                    # never shown the problem).
+                    event.acceptProposedAction()
+                    QTimer.singleShot(0, lambda fp=file_path: self.window().open_file_path(fp, target_editor=self))
                     return
         super().dropEvent(event)
         
@@ -1391,6 +1481,24 @@ class MainWindow(QMainWindow):
             editor = self.new_tab()
             
         try:
+            # If this editor already has focus (reusing the current tab via
+            # drag-drop or File > Open, as opposed to a freshly-created
+            # tab), calling setFocus() again later in this function is a
+            # no-op as far as Qt is concerned - focusInEvent() only fires on
+            # an actual no-focus -> focus transition. That means our
+            # focusInEvent cleanup (reasserting cursorFlashTime, restarting
+            # the blink timer, forcing a full repaint) never runs for the
+            # reuse case, which is exactly the case where the ghost/dead
+            # second cursor has been seen. Force a real focus-out/focus-in
+            # cycle around the swap so that cleanup always runs, regardless
+            # of whether this editor already had focus coming in.
+            had_focus = editor.hasFocus()
+            if had_focus:
+                editor.clearFocus()
+
+            editor._caret_visible = False
+            editor.viewport().repaint()
+
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             content = self.preprocess_markdown(content)
@@ -1978,7 +2086,14 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    
+
+    # Set this as early as possible, before any Editor/QTextEdit is
+    # constructed, so Qt's internal cursor-blink machinery never gets a
+    # chance to read a nonzero flash time in the first place. Editor also
+    # re-asserts this on every focusInEvent() as a defensive measure, since
+    # Windows can re-sync style hints from the system theme later on.
+    app.setCursorFlashTime(0)
+
     icon_path = os.path.join("icons", "notepad.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
