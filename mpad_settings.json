@@ -30,11 +30,16 @@
     "quote_size": 0,
     "quote_line_color": "#646464",
     "quote_line_width": 5,
+    "hr_color": "#5c5c5c",
+    "hr_thickness": 2,
     "link": "#3794ff",
     "link_size": 0,
     "link_underline": true,
     "table_header_bg": "#673AB7",
     "table_header_text": "#FFFFFF",
     "table_row1_bg": "#252526",
-    "table_row2_bg": "#540699"
+    "table_row2_bg": "#540699",
+    "tab_active_bg": "#1e1e1e",
+    "tab_inactive_bg": "#2d2d2d",
+    "tab_active_bar_color": "#007acc"
 }
