@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout
                                QTabWidget, QSizePolicy, QScrollArea)
 from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListFormat,
                            QKeySequence, QShortcut, QFont, QPalette,
-                           QAction, QTextCursor, QDragEnterEvent, QDropEvent, 
+                           QAction, QActionGroup, QTextCursor, QDragEnterEvent, QDropEvent, 
                            QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon)
 from PySide6.QtCore import QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect, QTimer
 
@@ -36,6 +36,9 @@ DEFAULT_SETTINGS = {
     "quote": "#6a9955", "quote_size": 0,
     "quote_line_color": "#5c5c5c",
     "quote_line_width": 3,
+
+    "hr_color": "#5c5c5c",
+    "hr_thickness": 2,
     "link": "#3794ff", "link_size": 0,
     "link_underline": True,
     
@@ -52,6 +55,7 @@ DEFAULT_SETTINGS = {
 CODE_PROP = QTextFormat.UserProperty + 1
 QUOTE_PROP = QTextFormat.UserProperty + 2
 BLOCK_CODE_PROP = QTextFormat.UserProperty + 3
+HR_PROP = QTextFormat.UserProperty + 4
 
 class LineNumberArea(QWidget):
     def __init__(self, editor):
@@ -70,6 +74,7 @@ class Editor(QTextEdit):
         super().__init__(parent)
         self.settings = settings
         self.current_file = None
+        self.view_mode = "formatted"
         self.setAcceptDrops(True)
         self.apply_settings()
 
@@ -313,6 +318,29 @@ class Editor(QTextEdit):
             block = nxt
         painter.end()
 
+        # Draw horizontal line (thematic break) blocks.
+        hr_painter = QPainter(self.viewport())
+        hr_thickness = max(1, int(round(self.settings.get('hr_thickness', 2))))
+        hr_qcolor = QColor(self.settings.get('hr_color', '#5c5c5c'))
+        hr_pen = QPen(hr_qcolor, hr_thickness)
+        hr_pen.setCapStyle(Qt.FlatCap)
+        hr_painter.setPen(hr_pen)
+
+        hr_block = self.document().firstBlock()
+        while hr_block.isValid():
+            hbf = hr_block.blockFormat()
+            if (hr_block.isValid() and hr_block.isVisible()
+                    and hbf.hasProperty(HR_PROP) and hbf.property(HR_PROP) == True):
+                rect = self.document().documentLayout().blockBoundingRect(hr_block)
+                y = int(rect.top() + rect.height() / 2 - self.verticalScrollBar().value())
+                if -hr_thickness <= y <= viewport_height + hr_thickness:
+                    left = 4
+                    right = self.viewport().width() - 4
+                    if right > left:
+                        hr_painter.drawLine(left, y, right, y)
+            hr_block = hr_block.next()
+        hr_painter.end()
+
         # Draw our own caret (see __init__ comment for why Qt's built-in
         # cursor rendering is disabled). Drawn last so it's always on top.
         if self.hasFocus() and self._caret_visible and not self.textCursor().hasSelection():
@@ -464,6 +492,21 @@ class Editor(QTextEdit):
             super().dragMoveEvent(event)
 
     def keyPressEvent(self, event):
+        cur_block_fmt = self.textCursor().block().blockFormat()
+        if (event.text() and event.key() not in (Qt.Key_Return, Qt.Key_Enter)
+                and cur_block_fmt.hasProperty(HR_PROP)
+                and cur_block_fmt.property(HR_PROP) == True):
+            # Typing directly into an empty horizontal-line block: drop the
+            # HR formatting first (it's always an empty block, so there's
+            # nothing to preserve) and let the keystroke insert normally.
+            cursor = self.textCursor()
+            cursor.beginEditBlock()
+            new_fmt = QTextBlockFormat(cur_block_fmt)
+            new_fmt.setProperty(HR_PROP, False)
+            cursor.setBlockFormat(new_fmt)
+            cursor.endEditBlock()
+            self.setTextCursor(cursor)
+
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             cursor = self.textCursor()
             block = cursor.block()
@@ -472,6 +515,28 @@ class Editor(QTextEdit):
                         and block_fmt.property(QUOTE_PROP) == True)
             is_block_code = (block_fmt.hasProperty(BLOCK_CODE_PROP)
                              and block_fmt.property(BLOCK_CODE_PROP) == True)
+            is_hr = (block_fmt.hasProperty(HR_PROP)
+                     and block_fmt.property(HR_PROP) == True)
+
+            if is_hr:
+                # A horizontal-line block is always empty; pressing Enter on
+                # it just turns it back into a normal empty paragraph
+                # in-place (same convention as exiting an empty quote/code
+                # line below), so the user can keep typing right below the
+                # line instead of getting stuck inside it.
+                cursor.beginEditBlock()
+                new_fmt = QTextBlockFormat(block_fmt)
+                new_fmt.setProperty(HR_PROP, False)
+                cursor.setBlockFormat(new_fmt)
+                new_char = QTextCharFormat()
+                new_char.setForeground(QColor(self.settings['editor_text']))
+                cursor.select(QTextCursor.BlockUnderCursor)
+                cursor.mergeCharFormat(new_char)
+                cursor.clearSelection()
+                cursor.endEditBlock()
+                self.setTextCursor(cursor)
+                self.window().update_toolbar_state()
+                return
 
             if is_quote:
                 if block.text().strip() == '':
@@ -580,7 +645,22 @@ class Editor(QTextEdit):
             if temp_cursor.currentTable():
                 block = next_block
                 continue
-            
+
+            block_fmt_hr = block.blockFormat()
+            if block_fmt_hr.hasProperty(QTextFormat.BlockTrailingHorizontalRulerWidth):
+                # Qt's own Markdown importer already recognizes "---" as a
+                # thematic break and marks the (empty) block with this
+                # property. Take over its rendering with our own HR_PROP so
+                # the line uses the user-configurable color/thickness
+                # instead of Qt's built-in style, and drop the native
+                # property so Qt doesn't also draw its own rule underneath.
+                new_hr_fmt = QTextBlockFormat(block_fmt_hr)
+                new_hr_fmt.clearProperty(QTextFormat.BlockTrailingHorizontalRulerWidth)
+                new_hr_fmt.setProperty(HR_PROP, True)
+                temp_cursor.setBlockFormat(new_hr_fmt)
+                block = next_block
+                continue
+
             text_list = temp_cursor.currentList()
             is_list = text_list is not None
             if is_list:
@@ -890,6 +970,14 @@ class SettingsDialog(QDialog):
         self.underline_check.setChecked(self.settings.get("link_underline", True))
         layout.addRow("Underline hyperlink:", self.underline_check)
 
+        self.add_color_picker(layout, "Horizontal Line", "hr_color")
+
+        self.hr_thickness_spin = QSpinBox()
+        self.hr_thickness_spin.setRange(1, 20)
+        self.hr_thickness_spin.setValue(self.settings.get("hr_thickness", 2))
+        self.hr_thickness_spin.setSuffix(" px")
+        layout.addRow("Horizontal line thickness:", self.hr_thickness_spin)
+
         layout.addRow(QLabel("--- Table Colors ---"))
         self.add_color_picker(layout, "Header (background)", "table_header_bg")
         self.add_color_picker(layout, "Header (text)", "table_header_text")
@@ -960,6 +1048,7 @@ class SettingsDialog(QDialog):
             self.settings[key] = spin.value()
         self.settings["link_underline"] = self.underline_check.isChecked()
         self.settings["quote_line_width"] = self.quote_line_width_spin.value()
+        self.settings["hr_thickness"] = self.hr_thickness_spin.value()
         super().accept()
 
     def get_settings(self):
@@ -1013,6 +1102,155 @@ class TableDialog(QDialog):
         return self.rows_spin.value(), self.cols_spin.value()
 
 
+class FindReplaceDialog(QDialog):
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.setWindowTitle("Find & Replace - MPad++")
+        self.setMinimumWidth(380)
+        # Non-modal "tool" style: stays on top of the editor without
+        # blocking interaction with it, like the find bar in most editors.
+        self.setWindowFlags(self.windowFlags() | Qt.Tool)
+
+        layout = QFormLayout(self)
+
+        self.find_input = QLineEdit()
+        self.find_input.returnPressed.connect(self.find_next)
+        layout.addRow("Find:", self.find_input)
+
+        self.replace_input = QLineEdit()
+        self.replace_input.returnPressed.connect(self.replace_current)
+        layout.addRow("Replace with:", self.replace_input)
+
+        self.case_check = QCheckBox("Case sensitive")
+        layout.addRow("", self.case_check)
+
+        find_btn_row = QWidget()
+        find_btn_layout = QHBoxLayout(find_btn_row)
+        find_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_prev = QPushButton("Find Previous")
+        self.btn_prev.clicked.connect(self.find_previous)
+        find_btn_layout.addWidget(self.btn_prev)
+        self.btn_next = QPushButton("Find Next")
+        self.btn_next.clicked.connect(self.find_next)
+        find_btn_layout.addWidget(self.btn_next)
+        layout.addRow(find_btn_row)
+
+        replace_btn_row = QWidget()
+        replace_btn_layout = QHBoxLayout(replace_btn_row)
+        replace_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self.btn_replace = QPushButton("Replace")
+        self.btn_replace.clicked.connect(self.replace_current)
+        replace_btn_layout.addWidget(self.btn_replace)
+        self.btn_replace_all = QPushButton("Replace All")
+        self.btn_replace_all.clicked.connect(self.replace_all)
+        replace_btn_layout.addWidget(self.btn_replace_all)
+        layout.addRow(replace_btn_row)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #999;")
+        layout.addRow(self.status_label)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.close)
+        layout.addRow(btn_close)
+
+    def get_editor(self):
+        return self.main_window.get_editor()
+
+    def _flags(self, backward=False):
+        flags = QTextDocument.FindFlags()
+        if self.case_check.isChecked():
+            flags |= QTextDocument.FindCaseSensitively
+        if backward:
+            flags |= QTextDocument.FindBackward
+        return flags
+
+    def _find(self, backward):
+        editor = self.get_editor()
+        if not editor:
+            return
+        text = self.find_input.text()
+        if not text:
+            self.status_label.setText("")
+            return
+        found = editor.find(text, self._flags(backward))
+        if not found:
+            # Wrap around: retry once from the start (or end, for backward
+            # searches) instead of leaving the user stuck at the boundary.
+            cursor = editor.textCursor()
+            cursor.movePosition(QTextCursor.End if backward else QTextCursor.Start)
+            editor.setTextCursor(cursor)
+            found = editor.find(text, self._flags(backward))
+        if found:
+            self.status_label.setText("")
+        else:
+            self.status_label.setText("Phrase not found")
+
+    def find_next(self):
+        self._find(backward=False)
+
+    def find_previous(self):
+        self._find(backward=True)
+
+    def replace_current(self):
+        editor = self.get_editor()
+        if not editor:
+            return
+        text = self.find_input.text()
+        if not text:
+            return
+        cursor = editor.textCursor()
+        selected = cursor.selectedText()
+        if self.case_check.isChecked():
+            matches = (selected == text)
+        else:
+            matches = (selected.lower() == text.lower())
+
+        if cursor.hasSelection() and matches:
+            cursor.insertText(self.replace_input.text())
+            editor.setTextCursor(cursor)
+
+        self.find_next()
+
+    def replace_all(self):
+        editor = self.get_editor()
+        if not editor:
+            return
+        text = self.find_input.text()
+        if not text:
+            return
+        replace_text = self.replace_input.text()
+        flags = self._flags(backward=False)
+
+        cursor = editor.textCursor()
+        cursor.beginEditBlock()
+
+        start_cursor = QTextCursor(editor.document())
+        start_cursor.movePosition(QTextCursor.Start)
+        editor.setTextCursor(start_cursor)
+
+        count = 0
+        while editor.find(text, flags):
+            match_cursor = editor.textCursor()
+            match_cursor.insertText(replace_text)
+            editor.setTextCursor(match_cursor)
+            count += 1
+
+        cursor.endEditBlock()
+        self.status_label.setText(f"Replaced {count} occurrence(s)" if count else "Phrase not found")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        editor = self.get_editor()
+        if editor:
+            selected = editor.textCursor().selectedText()
+            if selected and "\u2029" not in selected:
+                self.find_input.setText(selected)
+        self.find_input.setFocus()
+        self.find_input.selectAll()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1041,6 +1279,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tab_widget)
         self.setCentralWidget(container)
         
+        self.find_dialog = None
+
         self.create_menu()
         self.create_toolbar()
         self.create_shortcuts()
@@ -1114,6 +1354,29 @@ class MainWindow(QMainWindow):
         save_as_action.triggered.connect(self.save_as_file)
         file_menu.addAction(save_as_action)
         
+        edit_menu = menubar.addMenu("Edit")
+        find_replace_action = QAction("Find && Replace", self)
+        find_replace_action.setShortcut(QKeySequence("Ctrl+F"))
+        find_replace_action.triggered.connect(self.open_find_replace)
+        edit_menu.addAction(find_replace_action)
+
+        view_menu = menubar.addMenu("View")
+        self.view_action_group = QActionGroup(self)
+        self.view_action_group.setExclusive(True)
+
+        self.act_view_formatted = QAction("Formatted", self)
+        self.act_view_formatted.setCheckable(True)
+        self.act_view_formatted.setChecked(True)
+        self.act_view_formatted.triggered.connect(lambda: self.set_view_mode("formatted"))
+        self.view_action_group.addAction(self.act_view_formatted)
+        view_menu.addAction(self.act_view_formatted)
+
+        self.act_view_plain = QAction("Plain text", self)
+        self.act_view_plain.setCheckable(True)
+        self.act_view_plain.triggered.connect(lambda: self.set_view_mode("plain"))
+        self.view_action_group.addAction(self.act_view_plain)
+        view_menu.addAction(self.act_view_plain)
+
         settings_menu = menubar.addMenu("Settings")
         config_action = QAction("Configure Styles", self)
         config_action.triggered.connect(self.open_settings)
@@ -1172,6 +1435,11 @@ class MainWindow(QMainWindow):
         self.act_table.triggered.connect(self.insert_table)
         toolbar.addAction(self.act_table)
 
+        self.act_hr = QAction("Line", self)
+        self.act_hr.setToolTip("Insert horizontal line (---)")
+        self.act_hr.triggered.connect(self.insert_horizontal_line)
+        toolbar.addAction(self.act_hr)
+
         toolbar.addSeparator()
 
         self.act_link = QAction("Link", self); self.act_link.setCheckable(True)
@@ -1223,6 +1491,7 @@ class MainWindow(QMainWindow):
         new_cursor = new_editor.textCursor()
         new_cursor.insertFragment(frag)
         new_editor.current_file = editor.current_file
+        new_editor.view_mode = editor.view_mode
         self.update_tab_title(new_editor)
         self.tab_widget.setTabText(self.tab_widget.indexOf(new_editor), self.tab_widget.tabText(index) + " (Copy)")
         new_editor.style_tables()
@@ -1241,6 +1510,7 @@ class MainWindow(QMainWindow):
             self.update_toolbar_margin()
             self.update_window_title()
             self.update_toolbar_state()
+            self.update_view_menu_state()
 
     def update_tab_title(self, editor):
         idx = self.tab_widget.indexOf(editor)
@@ -1275,13 +1545,21 @@ class MainWindow(QMainWindow):
         
         md_lines = []
         in_code_block = False
-        
+        prev_was_quote = False
+
+        def ensure_blank_separator():
+            if md_lines and md_lines[-1] != "":
+                md_lines.append("")
+
         block = doc.firstBlock()
         while block.isValid():
             temp_cursor = QTextCursor(block)
             table = temp_cursor.currentTable()
             if table:
                 if block.position() == table.firstCursorPosition().block().position():
+                    if prev_was_quote:
+                        ensure_blank_separator()
+                        prev_was_quote = False
                     self.export_table_to_md(table, md_lines)
                     temp_cursor.setPosition(table.lastPosition() + 1)
                     block = temp_cursor.block()
@@ -1295,8 +1573,31 @@ class MainWindow(QMainWindow):
             
             is_block_code = block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True
             is_quote = block_fmt.hasProperty(QUOTE_PROP) and block_fmt.property(QUOTE_PROP) == True
+            is_hr = block_fmt.hasProperty(HR_PROP) and block_fmt.property(HR_PROP) == True
             level = block_fmt.headingLevel()
+
+            # CommonMark "lazily" folds a line straight after a blockquote
+            # into that same blockquote paragraph unless a blank line
+            # closes it off first, so any transition out of a quote block
+            # needs one inserted.
+            if prev_was_quote and not is_quote:
+                ensure_blank_separator()
+            prev_was_quote = is_quote
             
+            if is_hr:
+                if in_code_block:
+                    md_lines.append("```")
+                    in_code_block = False
+                # A bare "---" only reads back as a thematic break (rather
+                # than a Setext heading underline for whatever text came
+                # right before it) when it sits on its own blank-line-
+                # delimited paragraph.
+                ensure_blank_separator()
+                md_lines.append("---")
+                md_lines.append("")
+                block = block.next()
+                continue
+
             if is_block_code:
                 if not in_code_block:
                     md_lines.append("```")
@@ -1462,6 +1763,25 @@ class MainWindow(QMainWindow):
         if file_path:
             self.open_file_path(file_path, in_new_tab=in_new_tab)
 
+    def open_files_from_args(self, file_paths):
+        # Called once at startup for files passed on the command line
+        # (e.g. `python MPadPlusPlus.py notes.md other.md`). The very first
+        # one reuses the empty tab MainWindow already created in __init__
+        # (open_file_path loads straight into it without prompting, since
+        # an empty tab never triggers the "Tab Not Empty" dialog); every
+        # subsequent path gets its own new tab.
+        valid_paths = [p for p in file_paths if os.path.isfile(p)]
+        missing = [p for p in file_paths if not os.path.isfile(p)]
+
+        for i, path in enumerate(valid_paths):
+            self.open_file_path(path, in_new_tab=(i > 0))
+
+        if missing:
+            QMessageBox.warning(
+                self, "File Not Found",
+                "The following file(s) could not be found:\n" + "\n".join(missing)
+            )
+
     def open_file_path(self, file_path, target_editor=None, in_new_tab=False):
         editor = target_editor if target_editor else self.tab_widget.currentWidget()
         
@@ -1507,6 +1827,7 @@ class MainWindow(QMainWindow):
             editor.setExtraSelections([])
             editor.document().setMarkdown(content, QTextDocument.MarkdownDialectGitHub)
             editor.current_file = file_path
+            editor.view_mode = "formatted"
             editor.post_process_markdown()
             editor.style_tables()
             editor.apply_settings_to_document(restore_cursor=False)
@@ -1859,6 +2180,37 @@ class MainWindow(QMainWindow):
         editor.setTextCursor(cursor)
         self.update_toolbar_state()
 
+    def insert_horizontal_line(self):
+        editor = self.get_editor()
+        if not editor: return
+        cursor = editor.textCursor()
+        if cursor.currentTable(): return
+
+        cursor.beginEditBlock()
+        cursor.movePosition(QTextCursor.EndOfBlock)
+        if cursor.block().text() != "" or cursor.block().blockFormat().hasProperty(HR_PROP):
+            cursor.insertBlock()
+
+        hr_fmt = QTextBlockFormat()
+        cursor.setBlockFormat(hr_fmt)
+        cursor.setCharFormat(QTextCharFormat())
+        block_fmt = cursor.blockFormat()
+        block_fmt.setProperty(HR_PROP, True)
+        cursor.setBlockFormat(block_fmt)
+
+        # Drop a fresh normal paragraph right after the line so the user
+        # doesn't land with their cursor inside the (always-empty) HR block.
+        cursor.insertBlock()
+        new_fmt = QTextBlockFormat()
+        cursor.setBlockFormat(new_fmt)
+        new_char = QTextCharFormat()
+        new_char.setForeground(QColor(self.settings['editor_text']))
+        cursor.setCharFormat(new_char)
+
+        cursor.endEditBlock()
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+
     def insert_table(self):
         editor = self.get_editor()
         if not editor: return
@@ -2065,6 +2417,99 @@ class MainWindow(QMainWindow):
         self.act_ul.blockSignals(False)
         self.act_ol.blockSignals(False)
 
+        self.update_view_menu_state()
+        self.update_formatting_actions_enabled()
+
+    def update_view_menu_state(self):
+        editor = self.get_editor()
+        if not editor: return
+        self.act_view_formatted.blockSignals(True)
+        self.act_view_plain.blockSignals(True)
+        if editor.view_mode == "plain":
+            self.act_view_plain.setChecked(True)
+        else:
+            self.act_view_formatted.setChecked(True)
+        self.act_view_formatted.blockSignals(False)
+        self.act_view_plain.blockSignals(False)
+
+    def update_formatting_actions_enabled(self):
+        editor = self.get_editor()
+        is_plain = bool(editor) and editor.view_mode == "plain"
+        actions = [self.act_bold, self.act_italic, self.act_underline, self.act_code,
+                   self.act_quote, self.act_ul, self.act_ol, self.act_table,
+                   self.act_hr, self.act_link] + list(self.h_actions.values())
+        for action in actions:
+            action.setEnabled(not is_plain)
+
+    def set_view_mode(self, mode):
+        editor = self.get_editor()
+        if not editor or editor.view_mode == mode:
+            self.update_view_menu_state()
+            return
+
+        had_focus = editor.hasFocus()
+        if had_focus:
+            editor.clearFocus()
+        editor._caret_visible = False
+        editor.viewport().repaint()
+
+        was_modified = editor.document().isModified()
+        editor.document().setUndoRedoEnabled(False)
+        editor.setExtraSelections([])
+
+        if mode == "plain":
+            # Show the exact markdown source that File > Save would write,
+            # in a flat, uncolored style - no rich formatting to keep in
+            # sync while the user edits raw syntax directly.
+            md_text = self.export_markdown(editor)
+            editor.setPlainText(md_text)
+
+            flat_fmt = QTextCharFormat()
+            flat_fmt.setForeground(QColor(self.settings['editor_text']))
+            flat_fmt.setFontFamilies([self.settings['font_family']])
+            flat_fmt.setFontPointSize(self.settings['font_size'])
+            flat_fmt.setFontWeight(QFont.Normal)
+            flat_fmt.setFontItalic(False)
+            flat_fmt.setFontUnderline(False)
+            flat_fmt.setBackground(Qt.transparent)
+            select_cursor = QTextCursor(editor.document())
+            select_cursor.select(QTextCursor.Document)
+            select_cursor.mergeCharFormat(flat_fmt)
+        else:
+            text = editor.toPlainText()
+            editor.document().setMarkdown(text, QTextDocument.MarkdownDialectGitHub)
+            editor.post_process_markdown()
+            editor.apply_settings_to_document(restore_cursor=False)
+            editor.style_tables()
+
+        editor.view_mode = mode
+
+        start_cursor = QTextCursor(editor.document())
+        start_cursor.movePosition(QTextCursor.Start)
+        editor.setTextCursor(start_cursor)
+
+        editor.document().setUndoRedoEnabled(True)
+        editor.document().setModified(was_modified)
+
+        self.update_view_menu_state()
+        self.update_formatting_actions_enabled()
+
+        if had_focus:
+            editor.setFocus(Qt.OtherFocusReason)
+
+        def _finish_view_switch(ed=editor):
+            ed.ensureCursorVisible()
+            ed._reset_caret_blink()
+            ed.line_number_area.update()
+        QTimer.singleShot(0, _finish_view_switch)
+
+    def open_find_replace(self):
+        if self.find_dialog is None:
+            self.find_dialog = FindReplaceDialog(self)
+        self.find_dialog.show()
+        self.find_dialog.raise_()
+        self.find_dialog.activateWindow()
+
     def open_settings(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() == QDialog.Accepted:
@@ -2100,4 +2545,12 @@ if __name__ == "__main__":
         
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+
+    # Support `python MPadPlusPlus.py file1.md file2.md ...` - anything
+    # after the script name (skipping option-like "-x" flags) is treated
+    # as a file to open.
+    cli_files = [arg for arg in sys.argv[1:] if not arg.startswith('-')]
+    if cli_files:
+        window.open_files_from_args(cli_files)
+
+    sys.exit(app.exec())
