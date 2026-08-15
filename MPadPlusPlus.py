@@ -1,18 +1,20 @@
 import sys
 import json
 import os
+import re
 import webbrowser
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout, 
                                QHBoxLayout, QWidget, QToolBar, QDialog, 
                                QLabel, QLineEdit, QDialogButtonBox, QColorDialog, 
                                QPushButton, QFormLayout, QSpinBox, QFontDialog, 
                                QMessageBox, QFileDialog, QMenu, QToolButton, QCheckBox,
-                               QTabWidget, QSizePolicy, QScrollArea)
+                               QTabWidget, QSizePolicy, QScrollArea, QPlainTextEdit,
+                               QRadioButton, QButtonGroup)
 from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListFormat,
                            QKeySequence, QShortcut, QFont, QPalette,
                            QAction, QActionGroup, QTextCursor, QDragEnterEvent, QDropEvent, 
                            QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon)
-from PySide6.QtCore import QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect, QTimer
+from PySide6.QtCore import QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect, QRectF, QTimer
 
 # --- Default settings ---
 DEFAULT_SETTINGS = {
@@ -49,7 +51,12 @@ DEFAULT_SETTINGS = {
     
     "tab_active_bg": "#1e1e1e",
     "tab_inactive_bg": "#2d2d2d",
-    "tab_active_bar_color": "#007acc"
+    "tab_active_bar_color": "#007acc",
+
+    # How a Shift+Enter soft line break (within the same paragraph) is
+    # written to Markdown on save. One of: "br" (<br/>), "double_space"
+    # (two trailing spaces + newline), "backslash" (\ + newline).
+    "line_break_style": "double_space"
 }
 
 CODE_PROP = QTextFormat.UserProperty + 1
@@ -319,25 +326,41 @@ class Editor(QTextEdit):
         painter.end()
 
         # Draw horizontal line (thematic break) blocks.
+        # Using fillRect() instead of drawLine()+thick QPen: a stroked
+        # drawLine() is centered on the (float) y coordinate, so for a
+        # multi-pixel-wide pen the rasterizer has to decide how to split
+        # that width across pixel rows, and without antialiasing that
+        # rounding isn't guaranteed consistent from one y position to the
+        # next - producing lines that visibly differ in thickness. A
+        # filled rect of an exact integer height has no such ambiguity.
+        # On fractional display scaling (e.g. 125%/150%), a logical-pixel
+        # fillRect still has to land on the *device* pixel grid, and Qt/the
+        # OS rounds each line's top/bottom edge independently - so with a
+        # scale factor like 1.25, some lines round up to an extra device
+        # pixel and others don't, giving a visibly inconsistent 2px/3px mix
+        # even though the logical height is identical every time. Fix:
+        # compute the device-pixel height once (a constant), and only let
+        # the top edge - not the thickness - jitter by rounding.
         hr_painter = QPainter(self.viewport())
         hr_thickness = max(1, int(round(self.settings.get('hr_thickness', 2))))
         hr_qcolor = QColor(self.settings.get('hr_color', '#5c5c5c'))
-        hr_pen = QPen(hr_qcolor, hr_thickness)
-        hr_pen.setCapStyle(Qt.FlatCap)
-        hr_painter.setPen(hr_pen)
-
+        dpr = self.devicePixelRatioF() or 1.0
+        height_dev = max(1, round(hr_thickness * dpr))
         hr_block = self.document().firstBlock()
         while hr_block.isValid():
             hbf = hr_block.blockFormat()
             if (hr_block.isValid() and hr_block.isVisible()
                     and hbf.hasProperty(HR_PROP) and hbf.property(HR_PROP) == True):
                 rect = self.document().documentLayout().blockBoundingRect(hr_block)
-                y = int(rect.top() + rect.height() / 2 - self.verticalScrollBar().value())
-                if -hr_thickness <= y <= viewport_height + hr_thickness:
+                center_y = rect.top() + rect.height() / 2 - self.verticalScrollBar().value()
+                top_dev = round((center_y - hr_thickness / 2) * dpr)
+                top = top_dev / dpr
+                height = height_dev / dpr
+                if top + height >= 0 and top <= viewport_height:
                     left = 4
                     right = self.viewport().width() - 4
                     if right > left:
-                        hr_painter.drawLine(left, y, right, y)
+                        hr_painter.fillRect(QRectF(left, top, right - left, height), hr_qcolor)
             hr_block = hr_block.next()
         hr_painter.end()
 
@@ -423,7 +446,51 @@ class Editor(QTextEdit):
                 webbrowser.open(anchor, new=2)
         super().mousePressEvent(event)
 
+    def _find_char_run(self, click_pos, predicate):
+        """Find the contiguous run of characters around click_pos for which
+        predicate(char_format) is True, and return a QTextCursor selecting
+        it (or None if the clicked spot doesn't match at all).
+
+        Mirrors the hyperlink boundary-detection above: charFormat() always
+        reports the format of the character BEFORE the cursor's position,
+        never the one at/after it, so the cursor has to be nudged forward
+        by one to test the character actually under the click.
+        """
+        doc = self.document()
+        last = doc.characterCount() - 1
+
+        probe = QTextCursor(doc)
+        probe.setPosition(click_pos)
+        pos = click_pos
+        if not predicate(probe.charFormat()):
+            if click_pos < last:
+                probe.setPosition(click_pos + 1)
+                if predicate(probe.charFormat()):
+                    pos = click_pos + 1
+                else:
+                    return None
+            else:
+                return None
+
+        start_pos = end_pos = pos
+        while start_pos > 0:
+            probe.setPosition(start_pos)
+            if not predicate(probe.charFormat()):
+                break
+            start_pos -= 1
+        while end_pos < last:
+            probe.setPosition(end_pos + 1)
+            if not predicate(probe.charFormat()):
+                break
+            end_pos += 1
+
+        run = QTextCursor(doc)
+        run.setPosition(start_pos)
+        run.setPosition(end_pos, QTextCursor.KeepAnchor)
+        return run
+
     def contextMenuEvent(self, event):
+        click_pos = self.cursorForPosition(event.pos()).position()
         cursor = self.cursorForPosition(event.pos())
         fmt = cursor.charFormat()
         
@@ -444,7 +511,10 @@ class Editor(QTextEdit):
             
             while start_pos > 0:
                 temp = QTextCursor(self.document())
-                temp.setPosition(start_pos - 1)
+                # charFormat() reports the format of the character BEFORE
+                # the cursor position, not at it - so to test the character
+                # at index (start_pos - 1) the cursor must sit at start_pos.
+                temp.setPosition(start_pos)
                 if not temp.charFormat().isAnchor() or temp.charFormat().anchorHref() != href:
                     break
                 start_pos -= 1
@@ -460,11 +530,73 @@ class Editor(QTextEdit):
             anchor_cursor.setPosition(start_pos)
             anchor_cursor.setPosition(end_pos, QTextCursor.KeepAnchor)
             text = anchor_cursor.selectedText()
-            
+
+            menu.addSeparator()
+
+            # The standard "Copy" action above is only enabled when there's
+            # an active text selection, which right-clicking a link doesn't
+            # create - so it's greyed out here. These two are always
+            # available and copy exactly what you'd want from a link.
+            copy_link_action = QAction("Copy Hyperlink", menu)
+            copy_link_action.triggered.connect(lambda: QApplication.clipboard().setText(href))
+            menu.addAction(copy_link_action)
+
+            copy_md_action = QAction("Copy MD Hyperlink", menu)
+            copy_md_action.triggered.connect(lambda: QApplication.clipboard().setText(f"[{text}]({href})"))
+            menu.addAction(copy_md_action)
+
+            menu.addSeparator()
+
             edit_action = QAction("Edit Hyperlink", menu)
             edit_action.triggered.connect(lambda: self.window().edit_link_from_menu(self, anchor_cursor, text, href))
             menu.addAction(edit_action)
-            
+
+            remove_action = QAction("Remove Hyperlink", menu)
+            remove_action.triggered.connect(lambda: self.window().remove_hyperlink(self, anchor_cursor))
+            menu.addAction(remove_action)
+
+        # --- Remove Bold/Italic/Underline/Code/Quote/Heading ---
+        # Only offer removal for formatting actually present at the
+        # clicked spot, so the menu stays clean everywhere else.
+        format_removals = []
+
+        bold_run = self._find_char_run(click_pos, lambda f: f.fontWeight() == QFont.Bold)
+        if bold_run is not None:
+            format_removals.append(("Remove Bold", lambda checked=False, r=bold_run: self.window().remove_bold_format(self, r)))
+
+        italic_run = self._find_char_run(click_pos, lambda f: f.fontItalic())
+        if italic_run is not None:
+            format_removals.append(("Remove Italic", lambda checked=False, r=italic_run: self.window().remove_italic_format(self, r)))
+
+        underline_run = self._find_char_run(click_pos, lambda f: f.fontUnderline())
+        if underline_run is not None:
+            format_removals.append(("Remove Underline", lambda checked=False, r=underline_run: self.window().remove_underline_format(self, r)))
+
+        code_run = self._find_char_run(click_pos, lambda f: f.hasProperty(CODE_PROP) and f.property(CODE_PROP) == True)
+        if code_run is not None:
+            format_removals.append(("Remove Code", lambda checked=False, r=code_run: self.window().remove_code_format(self, r)))
+
+        click_block = QTextCursor(self.document()); click_block.setPosition(click_pos)
+        block = click_block.block()
+        block_fmt = block.blockFormat()
+
+        if block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True:
+            format_removals.append(("Remove Code Block", lambda checked=False, b=block: self.window().remove_code_block_format(self, b)))
+
+        if block_fmt.hasProperty(QUOTE_PROP) and block_fmt.property(QUOTE_PROP) == True:
+            format_removals.append(("Remove Quote", lambda checked=False, b=block: self.window().remove_quote_format(self, b)))
+
+        level = block_fmt.headingLevel()
+        if level > 0:
+            format_removals.append((f"Remove Heading (H{level})", lambda checked=False, b=block: self.window().remove_heading_format(self, b)))
+
+        if format_removals:
+            menu.addSeparator()
+            for label, handler in format_removals:
+                action = QAction(label, menu)
+                action.triggered.connect(handler)
+                menu.addAction(action)
+
         menu.exec(event.globalPos())
 
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -645,6 +777,21 @@ class Editor(QTextEdit):
             if temp_cursor.currentTable():
                 block = next_block
                 continue
+
+            # Qt's Markdown importer gives ordinary paragraphs a 6px
+            # top/bottom margin. QTextCursor.insertBlock() copies whatever
+            # format the current block has, so once a document has been
+            # loaded from Markdown every further Enter keeps propagating
+            # (and stacking with the document's own paragraph spacing)
+            # that margin, making each new line look like it has extra
+            # blank space above and below it. Strip it back to 0 so a
+            # block-format created by Enter never carries margins forward.
+            margin_fmt = block.blockFormat()
+            if margin_fmt.topMargin() != 0 or margin_fmt.bottomMargin() != 0:
+                new_margin_fmt = QTextBlockFormat(margin_fmt)
+                new_margin_fmt.setTopMargin(0)
+                new_margin_fmt.setBottomMargin(0)
+                temp_cursor.setBlockFormat(new_margin_fmt)
 
             block_fmt_hr = block.blockFormat()
             if block_fmt_hr.hasProperty(QTextFormat.BlockTrailingHorizontalRulerWidth):
@@ -1055,25 +1202,114 @@ class SettingsDialog(QDialog):
         return self.settings
 
 
-class LinkDialog(QDialog):
-    def __init__(self, selected_text, parent=None):
+class PreferencesDialog(QDialog):
+    def __init__(self, settings, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Add Hyperlink - MPad++")
+        self.settings = settings.copy()
+        self.setWindowTitle("Preferences - MPad++")
+        self.setMinimumWidth(350)
+
         layout = QFormLayout(self)
 
-        self.text_input = QLineEdit(selected_text)
-        self.url_input = QLineEdit("https://")
+        line_break_widget = QWidget()
+        line_break_layout = QVBoxLayout(line_break_widget)
+        line_break_layout.setContentsMargins(0, 0, 0, 0)
 
-        layout.addRow("Display text:", self.text_input)
-        layout.addRow("URL Address:", self.url_input)
+        self.line_break_group = QButtonGroup(line_break_widget)
+        self.line_break_radios = {}
+
+        line_break_options = [
+            ("br", "<br>"),
+            ("double_space", "[podwójna spacja]"),
+            ("backslash", "\\ i enter"),
+        ]
+        current_line_break = self.settings.get("line_break_style", "double_space")
+        for value, label_text in line_break_options:
+            radio = QRadioButton(label_text)
+            if value == current_line_break:
+                radio.setChecked(True)
+            self.line_break_group.addButton(radio)
+            self.line_break_radios[value] = radio
+            line_break_layout.addWidget(radio)
+
+        layout.addRow("Nowa linia (znak):", line_break_widget)
 
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
         layout.addRow(btn_box)
 
+    def accept(self):
+        for value, radio in self.line_break_radios.items():
+            if radio.isChecked():
+                self.settings["line_break_style"] = value
+                break
+        super().accept()
+
+    def get_settings(self):
+        return self.settings
+
+
+class LinkDialog(QDialog):
+    def __init__(self, selected_text, selected_url="https://", parent=None, allow_remove=False):
+        super().__init__(parent)
+        self.setWindowTitle("Hyperlink - MPad++")
+        # Wide and tall enough that a normal (or long) URL/display text is
+        # fully visible - wrapped across a couple of lines - instead of
+        # being scrolled/clipped inside a single-line field.
+        self.setMinimumWidth(640)
+        self.setMinimumHeight(340)
+        self.resize(680, 380)
+        layout = QFormLayout(self)
+
+        # Multi-line boxes so long values wrap onto several visible lines
+        # instead of scrolling sideways inside a thin bar. These still
+        # represent single-line values though, so Tab moves focus instead
+        # of indenting, and any stray Enter presses are stripped back out
+        # in get_data() rather than ending up inside the link's text/href.
+        self.text_input = QPlainTextEdit(selected_text)
+        self.text_input.setTabChangesFocus(True)
+        self.text_input.setMinimumHeight(90)
+
+        self.url_input = QPlainTextEdit(selected_url)
+        self.url_input.setTabChangesFocus(True)
+        self.url_input.setMinimumHeight(90)
+        # Make sure editing (or re-reading) an existing link always starts
+        # showing its beginning rather than wherever the field happened to
+        # scroll to.
+        url_cursor = self.url_input.textCursor()
+        url_cursor.movePosition(QTextCursor.Start)
+        self.url_input.setTextCursor(url_cursor)
+        self.url_input.selectAll()
+
+        layout.addRow("Display text:", self.text_input)
+        layout.addRow("URL Address:", self.url_input)
+
+        self._removed = False
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        if allow_remove:
+            remove_btn = btn_box.addButton("Remove Link", QDialogButtonBox.DestructiveRole)
+            remove_btn.clicked.connect(self._on_remove)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addRow(btn_box)
+
+    def _on_remove(self):
+        self._removed = True
+        self.accept()
+
+    def is_removed(self):
+        return self._removed
+
     def get_data(self):
-        return self.text_input.text(), self.url_input.text()
+        # Collapse any Enter presses back to spaces - these boxes are for
+        # comfortable editing of single-line values, not real multi-line
+        # text, so a stray newline should never end up inside the anchor's
+        # display text or href.
+        text = " ".join(self.text_input.toPlainText().splitlines()).strip()
+        url = " ".join(self.url_input.toPlainText().splitlines()).strip()
+        return text, url
 
 
 class TableDialog(QDialog):
@@ -1382,6 +1618,10 @@ class MainWindow(QMainWindow):
         config_action.triggered.connect(self.open_settings)
         settings_menu.addAction(config_action)
 
+        prefs_action = QAction("Preferences", self)
+        prefs_action.triggered.connect(self.open_preferences)
+        settings_menu.addAction(prefs_action)
+
     def create_toolbar(self):
         toolbar = QToolBar("Formatting")
         toolbar.setMovable(False)
@@ -1546,10 +1786,76 @@ class MainWindow(QMainWindow):
         md_lines = []
         in_code_block = False
         prev_was_quote = False
+        # When the "<br>" line-break style bridges two adjacent plain
+        # paragraphs, the next block's text must be appended onto the
+        # SAME md_lines entry (no extra raw "\n" in between) - see the
+        # comment on needs_paragraph_break_marker() below for why.
+        pending_br_merge = False
 
         def ensure_blank_separator():
             if md_lines and md_lines[-1] != "":
                 md_lines.append("")
+
+        def needs_paragraph_break_marker(block):
+            # Two adjacent plain paragraph blocks (created by pressing
+            # Enter, not Shift+Enter) are joined below by a single '\n'
+            # with no blank line between them. CommonMark's "lazy
+            # continuation" rule means that, read back with no marker,
+            # they'd silently merge into one re-wrapped paragraph - so
+            # the configured hard-line-break style has to be applied
+            # here too, not just at Shift+Enter (U+2028) points.
+            #
+            # Special case for the "<br>" style: unlike the backslash
+            # and double-space CommonMark constructs (which consume the
+            # newline right after them as part of the break itself),
+            # "<br/>" is just inline raw HTML - a literal "\n" straight
+            # after it is parsed as a *separate*, ordinary soft line
+            # break, which renders as an extra leading space on the next
+            # line. So when "<br>" is selected, the next block's text is
+            # merged onto the same md_lines entry (pending_br_merge)
+            # instead of starting a new one, keeping the tag and the
+            # following text on the same raw source line.
+            next_block = block.next()
+            if not next_block.isValid():
+                return False
+            next_text = next_block.text()
+            if next_text == "":
+                return False
+            if QTextCursor(next_block).currentTable():
+                return False
+            next_fmt = next_block.blockFormat()
+            if next_fmt.headingLevel() > 0:
+                return False
+            if next_fmt.hasProperty(QUOTE_PROP) and next_fmt.property(QUOTE_PROP) == True:
+                return False
+            if next_fmt.hasProperty(HR_PROP) and next_fmt.property(HR_PROP) == True:
+                return False
+            if next_fmt.hasProperty(BLOCK_CODE_PROP) and next_fmt.property(BLOCK_CODE_PROP) == True:
+                return False
+            next_stripped = next_text.lstrip()
+            if next_stripped.startswith(("• ", "- ", "* ")):
+                return False
+            if len(next_stripped) > 2 and next_stripped[0].isdigit() and next_stripped[1] == '.' and next_stripped[2] == ' ':
+                return False
+            return True
+
+        def line_break_suffix():
+            style = self.settings.get("line_break_style", "double_space")
+            if style == "br":
+                # Written out exactly as "<br>" (no self-closing slash) so
+                # the saved file / Plain Text source matches what someone
+                # would naturally type by hand. preprocess_markdown()
+                # still upgrades it to the self-closing "<br/>" form
+                # in-memory, right before handing text to Qt's Markdown
+                # importer, since that's the only form Qt reliably reads
+                # back as a real line break - but that upgrade is never
+                # written back to disk, so the on-disk/Plain Text text
+                # stays "<br>".
+                return "<br>"
+            elif style == "backslash":
+                return "\\"
+            else:
+                return "  "
 
         block = doc.firstBlock()
         while block.isValid():
@@ -1560,6 +1866,7 @@ class MainWindow(QMainWindow):
                     if prev_was_quote:
                         ensure_blank_separator()
                         prev_was_quote = False
+                    pending_br_merge = False
                     self.export_table_to_md(table, md_lines)
                     temp_cursor.setPosition(table.lastPosition() + 1)
                     block = temp_cursor.block()
@@ -1585,6 +1892,7 @@ class MainWindow(QMainWindow):
             prev_was_quote = is_quote
             
             if is_hr:
+                pending_br_merge = False
                 if in_code_block:
                     md_lines.append("```")
                     in_code_block = False
@@ -1599,6 +1907,7 @@ class MainWindow(QMainWindow):
                 continue
 
             if is_block_code:
+                pending_br_merge = False
                 if not in_code_block:
                     md_lines.append("```")
                     in_code_block = True
@@ -1611,8 +1920,10 @@ class MainWindow(QMainWindow):
                     in_code_block = False
                     
             if level > 0:
+                pending_br_merge = False
                 md_lines.append("#" * level + " " + self.get_inline_md(block))
             elif is_quote:
+                pending_br_merge = False
                 md_lines.append("> " + self.get_inline_md(block))
             else:
                 stripped = text.lstrip()
@@ -1629,12 +1940,27 @@ class MainWindow(QMainWindow):
                     skip = 3
                     
                 if prefix:
+                    pending_br_merge = False
                     md_lines.append(prefix + self.get_inline_md(block, skip))
                 else:
                     if text == "":
+                        pending_br_merge = False
                         md_lines.append("")
                     else:
-                        md_lines.append(self.get_inline_md(block))
+                        line = self.get_inline_md(block)
+                        if pending_br_merge:
+                            md_lines[-1] += line
+                        else:
+                            md_lines.append(line)
+                        pending_br_merge = False
+
+                        if needs_paragraph_break_marker(block):
+                            style = self.settings.get("line_break_style", "double_space")
+                            if style == "br":
+                                md_lines[-1] += "<br>"
+                                pending_br_merge = True
+                            else:
+                                md_lines[-1] += line_break_suffix()
                         
             block = block.next()
             
@@ -1687,7 +2013,7 @@ class MainWindow(QMainWindow):
                         
                 if not text:
                     continue
-                    
+
                 fmt = frag.charFormat()
                 is_code = fmt.hasProperty(CODE_PROP) and fmt.property(CODE_PROP) == True
                 is_anchor = fmt.isAnchor()
@@ -1696,20 +2022,95 @@ class MainWindow(QMainWindow):
                 is_underline = fmt.fontUnderline()
                 
                 if is_code:
-                    result += f"`{text}`"
+                    piece = f"`{text}`"
                 elif is_anchor:
-                    result += f"[{text}]({fmt.anchorHref()})"
+                    piece = f"[{self.escape_md_text(text)}]({fmt.anchorHref()})"
                 else:
-                    tmp = text
+                    # Any of these characters, typed as literal text rather
+                    # than intended as markup, would otherwise be misread
+                    # as real Markdown syntax on reload (turning a literal
+                    # "*note*" into italics, a stray "_" into an
+                    # underscore-emphasis marker, "<tag>" into raw HTML,
+                    # etc.) - escaping them here keeps plain typed text
+                    # showing up as plain text, both in the Plain Text view
+                    # and after switching back to Formatted.
+                    tmp = self.escape_md_text(text)
                     if is_bold and level == 0:
                         tmp = f"**{tmp}**"
                     if is_italic and level == 0 and not is_quote:
                         tmp = f"*{tmp}*"
                     if is_underline:
                         tmp = f"<u>{tmp}</u>"
-                    result += tmp
+                    piece = tmp
+
+                # Shift+Enter inserts a U+2028 LINE SEPARATOR inside the
+                # current block rather than starting a new one. Left as-is
+                # it's an invisible character that Markdown (and most text
+                # editors) don't understand, so a shift+enter line break
+                # would silently vanish on save/reload. Turn it into
+                # whichever hard-line-break syntax is configured in
+                # Settings > Preferences so it survives the round trip -
+                # it comes back as a normal line break on reopen.
+                #
+                # This substitution happens *after* escape_md_text() above,
+                # not before: escaping runs over whatever literal text the
+                # user typed, and U+2028 itself is never part of that
+                # escape-char set, so it passes through untouched either
+                # way. Doing the replacement first (on `text`) used to mean
+                # the freshly-inserted "<br/>" (or backslash) got escaped
+                # right along with it, turning it into a literal
+                # "\<br/\>" that Qt's Markdown reader doesn't recognize as
+                # a tag at all - it showed up as visible backslash-escaped
+                # text in the reopened document instead of an actual line
+                # break.
+                if '\u2028' in piece:
+                    style = self.settings.get("line_break_style", "double_space")
+                    if style == "br":
+                        # Written out exactly as "<br>" - preprocess_markdown()
+                        # is what upgrades a bare "<br>" to the self-closing
+                        # "<br/>" form Qt's importer needs, but only
+                        # in-memory right before parsing, never back to the
+                        # saved file/Plain Text source. This is also the
+                        # only one of the three styles that reopens as a
+                        # genuine same-block soft break (mirroring the
+                        # original Shift+Enter).
+                        #
+                        # No trailing "\n" here (unlike the other two
+                        # styles below): a literal newline right after
+                        # "<br>" isn't consumed as part of the tag the
+                        # way it is for the backslash/double-space hard-
+                        # break constructs - it's parsed as a *separate*
+                        # ordinary soft break, which would add a spurious
+                        # leading space to the next line on reload.
+                        replacement = "<br>"
+                    elif style == "backslash":
+                        # CommonMark hard break. Reopens as two separate
+                        # blocks/paragraphs rather than one block with an
+                        # internal soft break - visually identical, but
+                        # worth knowing if later code walks blocks.
+                        replacement = "\\\n"
+                    else:
+                        # CommonMark hard break (two trailing spaces).
+                        # Same two-block caveat as the backslash style above.
+                        replacement = "  \n"
+                    piece = piece.replace('\u2028', replacement)
+
+                result += piece
             it += 1
         return result
+
+    # Previously this backslash-escaped literal Markdown-special characters
+    # (\ ` * _ [ ] < > ~ |) in plain typed text before export, so they'd
+    # read back as the exact same literal characters instead of being
+    # reinterpreted as emphasis, code spans, links, or raw HTML. Disabled
+    # on request, to match how other editors export - typed text is now
+    # written out as-is. Trade-off: a literally typed "*note*", "_x_",
+    # "<tag>", etc. can be reinterpreted as real Markdown syntax the next
+    # time the file is reopened.
+    MD_ESCAPE_CHARS = r'\`*_[]<>~|'
+
+    def escape_md_text(self, text):
+        return text
 
     # --- File Operations ---
     def preprocess_markdown(self, content):
@@ -1731,6 +2132,30 @@ class MainWindow(QMainWindow):
                     prev_type = 'code'
                 continue
 
+            # Normalize the recognized hard-line-break tag before Qt's
+            # own Markdown importer ever sees it. Qt's importer only
+            # reliably turns a self-closing "<br/>" into a real in-
+            # paragraph line break; a bare "<br>" (no closing slash)
+            # makes it drop the rest of that paragraph on load instead.
+            # The primary symbol looked for on read is the bare "<br>"
+            # (matching what someone would naturally type by hand), and
+            # the self-closing "<br/>" is also recognized as an
+            # alternate - both are rewritten here to the self-closing
+            # form so either one reopens correctly. Left alone inside
+            # fenced code blocks (handled above) so example HTML isn't
+            # rewritten.
+            #
+            # Also tolerates the backslash-escaped "\<br/\>" that older
+            # versions of this app used to write (a since-fixed export
+            # bug used to run "<" and ">" through Markdown-escaping
+            # *after* inserting the literal "<br/>" tag, corrupting it).
+            # Files saved back then have that broken form baked in on
+            # disk; this normalizes it back to a real line break too so
+            # such files self-heal on open instead of showing literal
+            # "<br/>" text forever.
+            line = re.sub(r'\\?<br\s*/?\\?>', '<br/>', line)
+            stripped = line.lstrip()
+
             if stripped.startswith('```'):
                 current_type = 'code'
                 in_md_code_block = True
@@ -1738,6 +2163,18 @@ class MainWindow(QMainWindow):
                 current_type = 'quote'
             elif stripped.startswith('#'):
                 current_type = 'header'
+            elif re.fullmatch(r'-{1,}\s*', stripped) or re.fullmatch(r'={1,}\s*', stripped):
+                # A run of "-" or "=" directly under a text line is what
+                # CommonMark reads as a Setext heading underline (H2/H1),
+                # not a horizontal rule - so a line like this left over
+                # from an older save (or a hand-edited file) would
+                # silently swallow the paragraph above it into a heading.
+                # This app only ever writes headings as "#"/"##" ATX
+                # syntax, so any such underline is forced onto its own
+                # blank-line-delimited paragraph below, which reads back
+                # as a horizontal rule (or, for "=", inert plain text)
+                # instead.
+                current_type = 'hr_underline'
             elif stripped.startswith(('- ', '* ', '• ')) or (
                     len(stripped) > 2 and stripped[0].isdigit()
                     and stripped[1] == '.' and stripped[2] == ' '):
@@ -1746,7 +2183,7 @@ class MainWindow(QMainWindow):
                 current_type = 'normal'
 
             if current_type != prev_type:
-                if current_type in ('quote', 'header') or prev_type in ('quote', 'header'):
+                if current_type in ('quote', 'header', 'hr_underline') or prev_type in ('quote', 'header'):
                     if new_lines and new_lines[-1].strip() != '':
                         new_lines.append('')
 
@@ -2186,29 +2623,26 @@ class MainWindow(QMainWindow):
         cursor = editor.textCursor()
         if cursor.currentTable(): return
 
+        # Remember where the caret was so we can put it back afterwards -
+        # inserting the line below shouldn't drag the cursor along with it.
+        orig_pos = cursor.position()
+
         cursor.beginEditBlock()
         cursor.movePosition(QTextCursor.EndOfBlock)
         if cursor.block().text() != "" or cursor.block().blockFormat().hasProperty(HR_PROP):
             cursor.insertBlock()
 
         hr_fmt = QTextBlockFormat()
+        hr_fmt.setProperty(HR_PROP, True)
         cursor.setBlockFormat(hr_fmt)
         cursor.setCharFormat(QTextCharFormat())
-        block_fmt = cursor.blockFormat()
-        block_fmt.setProperty(HR_PROP, True)
-        cursor.setBlockFormat(block_fmt)
-
-        # Drop a fresh normal paragraph right after the line so the user
-        # doesn't land with their cursor inside the (always-empty) HR block.
-        cursor.insertBlock()
-        new_fmt = QTextBlockFormat()
-        cursor.setBlockFormat(new_fmt)
-        new_char = QTextCharFormat()
-        new_char.setForeground(QColor(self.settings['editor_text']))
-        cursor.setCharFormat(new_char)
-
         cursor.endEditBlock()
-        editor.setTextCursor(cursor)
+
+        # No extra blank paragraph is inserted after the line - the caret
+        # goes right back to where it was before the line was added.
+        restore_cursor = QTextCursor(editor.document())
+        restore_cursor.setPosition(orig_pos)
+        editor.setTextCursor(restore_cursor)
         editor.setFocus()
 
     def insert_table(self):
@@ -2279,7 +2713,7 @@ class MainWindow(QMainWindow):
             editor.setTextCursor(cursor)
             return
 
-        dialog = LinkDialog(selected_text, self)
+        dialog = LinkDialog(selected_text, "https://", self)
         if dialog.exec() == QDialog.Accepted:
             text, url = dialog.get_data()
             if text and url:
@@ -2292,8 +2726,14 @@ class MainWindow(QMainWindow):
                 editor.setTextCursor(cursor)
 
     def edit_link_from_menu(self, editor, cursor, old_text, old_url):
-        dialog = LinkDialog(old_text, self)
+        # allow_remove=True adds a "Remove Link" button, so removing a
+        # hyperlink no longer depends on fiddling with selections/toolbar
+        # toggles - it's always available right here.
+        dialog = LinkDialog(old_text, old_url, self, allow_remove=True)
         if dialog.exec() == QDialog.Accepted:
+            if dialog.is_removed():
+                self.remove_hyperlink(editor, cursor)
+                return
             new_text, new_url = dialog.get_data()
             if new_text and new_url:
                 fmt = QTextCharFormat()
@@ -2303,6 +2743,103 @@ class MainWindow(QMainWindow):
                 fmt.setFontUnderline(self.settings.get("link_underline", True))
                 cursor.insertText(new_text, fmt)
                 editor.setTextCursor(cursor)
+
+    def remove_hyperlink(self, editor, cursor):
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(self.settings['editor_text']))
+        fmt.setAnchor(False)
+        fmt.setAnchorHref("")
+        fmt.setFontUnderline(False)
+        cursor.mergeCharFormat(fmt)
+        editor.setTextCursor(cursor)
+
+    # --- Remove <format> from context menu (PPM > Remove Bold/Headline/etc.) ---
+    def remove_bold_format(self, editor, run_cursor):
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Normal)
+        fmt.setForeground(QColor(self.settings['editor_text']))
+        run_cursor.mergeCharFormat(fmt)
+        editor.setTextCursor(run_cursor)
+        self.update_toolbar_state()
+
+    def remove_italic_format(self, editor, run_cursor):
+        fmt = QTextCharFormat()
+        fmt.setFontItalic(False)
+        fmt.setForeground(QColor(self.settings['editor_text']))
+        run_cursor.mergeCharFormat(fmt)
+        editor.setTextCursor(run_cursor)
+        self.update_toolbar_state()
+
+    def remove_underline_format(self, editor, run_cursor):
+        fmt = QTextCharFormat()
+        fmt.setFontUnderline(False)
+        fmt.setForeground(QColor(self.settings['editor_text']))
+        run_cursor.mergeCharFormat(fmt)
+        editor.setTextCursor(run_cursor)
+        self.update_toolbar_state()
+
+    def remove_code_format(self, editor, run_cursor):
+        fmt = QTextCharFormat()
+        fmt.setBackground(Qt.transparent)
+        fmt.setForeground(QColor(self.settings['editor_text']))
+        fmt.setFontFamilies([self.settings['font_family']])
+        fmt.setProperty(CODE_PROP, False)
+        run_cursor.mergeCharFormat(fmt)
+        editor.setTextCursor(run_cursor)
+        self.update_toolbar_state()
+
+    def remove_code_block_format(self, editor, block):
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.StartOfBlock)
+        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+        block_fmt = QTextBlockFormat(block.blockFormat())
+        block_fmt.setProperty(BLOCK_CODE_PROP, False)
+        block_fmt.setBackground(Qt.transparent)
+        char_fmt = QTextCharFormat()
+        char_fmt.setForeground(QColor(self.settings['editor_text']))
+        char_fmt.setFontFamilies([self.settings['font_family']])
+        char_fmt.setProperty(CODE_PROP, False)
+        char_fmt.setBackground(Qt.transparent)
+        cursor.beginEditBlock()
+        cursor.setBlockFormat(block_fmt)
+        cursor.mergeCharFormat(char_fmt)
+        cursor.endEditBlock()
+        editor.setTextCursor(cursor)
+        self.update_toolbar_state()
+
+    def remove_quote_format(self, editor, block):
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.StartOfBlock)
+        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+        block_fmt = QTextBlockFormat(block.blockFormat())
+        block_fmt.setLeftMargin(0)
+        block_fmt.setProperty(QUOTE_PROP, False)
+        char_fmt = QTextCharFormat()
+        char_fmt.setFontItalic(False)
+        char_fmt.setForeground(QColor(self.settings['editor_text']))
+        cursor.beginEditBlock()
+        cursor.setBlockFormat(block_fmt)
+        cursor.mergeCharFormat(char_fmt)
+        cursor.endEditBlock()
+        editor.setTextCursor(cursor)
+        self.update_toolbar_state()
+
+    def remove_heading_format(self, editor, block):
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.StartOfBlock)
+        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+        block_fmt = QTextBlockFormat(block.blockFormat())
+        block_fmt.setHeadingLevel(0)
+        char_fmt = QTextCharFormat()
+        char_fmt.setFontPointSize(self.settings["font_size"])
+        char_fmt.setForeground(QColor(self.settings["editor_text"]))
+        char_fmt.setFontWeight(QFont.Normal)
+        cursor.beginEditBlock()
+        cursor.setBlockFormat(block_fmt)
+        cursor.mergeCharFormat(char_fmt)
+        cursor.endEditBlock()
+        editor.setTextCursor(cursor)
+        self.update_toolbar_state()
 
     # --- Keyboard shortcuts for lines ---
     def duplicate_line(self):
@@ -2472,11 +3009,35 @@ class MainWindow(QMainWindow):
             flat_fmt.setFontItalic(False)
             flat_fmt.setFontUnderline(False)
             flat_fmt.setBackground(Qt.transparent)
+            # Custom properties (CODE_PROP here - the only char-level one;
+            # QUOTE_PROP/BLOCK_CODE_PROP/HR_PROP are block-level and are
+            # already gone since setPlainText() above rebuilds the blocks
+            # from scratch) aren't touched by properties simply left unset
+            # on flat_fmt, so it's spelled out explicitly rather than
+            # relying on it defaulting to "off".
+            flat_fmt.setProperty(CODE_PROP, False)
+            # Anchor state (link color/underline/href) is explicitly
+            # cleared too, for the same reason - otherwise leftover anchor
+            # formatting from whatever the editor's live cursor last had
+            # active can carry into the freshly-typed plain text.
+            flat_fmt.setAnchor(False)
+            flat_fmt.setAnchorHref("")
             select_cursor = QTextCursor(editor.document())
             select_cursor.select(QTextCursor.Document)
-            select_cursor.mergeCharFormat(flat_fmt)
+            # setCharFormat() (not mergeCharFormat()) so this is a full
+            # replace: every character in Plain Text view ends up with
+            # exactly flat_fmt and nothing else, instead of flat_fmt
+            # merged on top of whatever format happened to still be
+            # active - the previous merge-based approach could leave
+            # invisible leftover formatting (most notably CODE_PROP)
+            # sitting on characters that looked plain on screen.
+            select_cursor.setCharFormat(flat_fmt)
         else:
-            text = editor.toPlainText()
+            # Route back through the same normalization used for File >
+            # Open (currently: <br>/<br/> line-break-tag handling), so
+            # raw markdown typed or edited by hand in plain-text mode
+            # reads back the same way a saved-and-reopened file would.
+            text = self.preprocess_markdown(editor.toPlainText())
             editor.document().setMarkdown(text, QTextDocument.MarkdownDialectGitHub)
             editor.post_process_markdown()
             editor.apply_settings_to_document(restore_cursor=False)
@@ -2527,6 +3088,12 @@ class MainWindow(QMainWindow):
                 editor.highlight_current_line()
             
             self.update_toolbar_margin()
+
+    def open_preferences(self):
+        dialog = PreferencesDialog(self.settings, self)
+        if dialog.exec() == QDialog.Accepted:
+            self.settings.update(dialog.get_settings())
+            self.save_settings()
 
 
 if __name__ == "__main__":
