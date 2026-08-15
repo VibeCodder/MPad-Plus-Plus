@@ -13,8 +13,15 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout
 from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListFormat,
                            QKeySequence, QShortcut, QFont, QPalette,
                            QAction, QActionGroup, QTextCursor, QDragEnterEvent, QDropEvent, 
-                           QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon)
+                           QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon, QPixmap)
 from PySide6.QtCore import QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect, QRectF, QTimer
+
+try:
+    from PySide6.QtSvg import QSvgRenderer
+except ImportError:
+    # Toolbar icons degrade gracefully to text-only buttons if the
+    # optional QtSvg module isn't installed alongside PySide6.
+    QSvgRenderer = None
 
 # --- Default settings ---
 DEFAULT_SETTINGS = {
@@ -63,6 +70,89 @@ CODE_PROP = QTextFormat.UserProperty + 1
 QUOTE_PROP = QTextFormat.UserProperty + 2
 BLOCK_CODE_PROP = QTextFormat.UserProperty + 3
 HR_PROP = QTextFormat.UserProperty + 4
+
+# --- Toolbar icons ---
+# Simple, original monoline glyphs (20x20 viewBox). "{color}" is filled in
+# at render time with the current theme's toolbar text color, so icons stay
+# legible across light/dark themes without needing separate asset files.
+TOOLBAR_SVG_ICONS = {
+    "bold": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <path fill="{color}" d="M5 3h6a3.5 3.5 0 0 1 2.4 6.05A3.75 3.75 0 0 1 11.5 16H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z
+                   M7 5.5v3.5h4a1.75 1.75 0 0 0 0-3.5H7z
+                   M7 11v3.5h4.5a1.75 1.75 0 0 0 0-3.5H7z"/>
+        </svg>""",
+    "italic": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <path fill="{color}" d="M8 3.5h6.5a1 1 0 1 1 0 2H12l-3 9h2.5a1 1 0 1 1 0 2H5a1 1 0 1 1 0-2h2.5l3-9H8a1 1 0 1 1 0-2z"/>
+        </svg>""",
+    "underline": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <path fill="{color}" d="M5.5 3a1 1 0 0 1 1 1v5.2a3.5 3.5 0 0 0 7 0V4a1 1 0 1 1 2 0v5.2a5.5 5.5 0 0 1-11 0V4a1 1 0 0 1 1-1z"/>
+          <rect fill="{color}" x="4" y="16" width="12" height="1.6" rx="0.8"/>
+        </svg>""",
+    "code": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <path fill="none" stroke="{color}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"
+                d="M7 5.5 2.8 10 7 14.5 M13 5.5 17.2 10 13 14.5"/>
+        </svg>""",
+    "quote": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <path fill="{color}" d="M4 6.5a3 3 0 0 1 3-3h.3a1 1 0 1 1 0 2H7a1 1 0 0 0-1 1v.3c1.4.2 2.5 1.4 2.5 2.9a3 3 0 0 1-3 3A3 3 0 0 1 2.5 9.7V9.6A3 3 0 0 1 4 6.5z
+                   M11.7 6.5a3 3 0 0 1 3-3h.3a1 1 0 1 1 0 2h-.3a1 1 0 0 0-1 1v.3c1.4.2 2.5 1.4 2.5 2.9a3 3 0 0 1-3 3 3 3 0 0 1-3-2.9v-.1a3 3 0 0 1 1.5-3.2z"/>
+        </svg>""",
+    "ul": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <circle fill="{color}" cx="3.3" cy="5" r="1.4"/>
+          <circle fill="{color}" cx="3.3" cy="10" r="1.4"/>
+          <circle fill="{color}" cx="3.3" cy="15" r="1.4"/>
+          <rect fill="{color}" x="7" y="4.1" width="10" height="1.8" rx="0.9"/>
+          <rect fill="{color}" x="7" y="9.1" width="10" height="1.8" rx="0.9"/>
+          <rect fill="{color}" x="7" y="14.1" width="10" height="1.8" rx="0.9"/>
+        </svg>""",
+    "ol": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <text x="1" y="6.6" font-family="sans-serif" font-size="5.4" fill="{color}">1</text>
+          <text x="1" y="11.6" font-family="sans-serif" font-size="5.4" fill="{color}">2</text>
+          <text x="1" y="16.6" font-family="sans-serif" font-size="5.4" fill="{color}">3</text>
+          <rect fill="{color}" x="7" y="4.1" width="10" height="1.8" rx="0.9"/>
+          <rect fill="{color}" x="7" y="9.1" width="10" height="1.8" rx="0.9"/>
+          <rect fill="{color}" x="7" y="14.1" width="10" height="1.8" rx="0.9"/>
+        </svg>""",
+    "table": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <rect fill="none" stroke="{color}" stroke-width="1.6" x="3" y="4" width="14" height="12" rx="1.2"/>
+          <path fill="none" stroke="{color}" stroke-width="1.6" d="M3 8.3h14 M3 12.6h14 M9 4v12"/>
+        </svg>""",
+    "line": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <rect fill="{color}" x="3" y="9.1" width="14" height="1.8" rx="0.9"/>
+        </svg>""",
+    "link": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <path fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"
+                d="M8.2 11.8 11.8 8.2 M7.8 5.9l1.2-1.2a3 3 0 0 1 4.3 4.3l-1.2 1.2
+                   M12.2 14.1 11 15.3a3 3 0 0 1-4.3-4.3l1.2-1.2"/>
+        </svg>""",
+}
+
+
+def make_svg_icon(name, color, size=18):
+    """Render one of TOOLBAR_SVG_ICONS, tinted to `color`, as a QIcon.
+    Returns a blank QIcon if QtSvg isn't available, so toolbar buttons
+    still work (just without an icon) rather than crashing the app."""
+    if QSvgRenderer is None or name not in TOOLBAR_SVG_ICONS:
+        return QIcon()
+    svg_data = TOOLBAR_SVG_ICONS[name].format(color=color).encode("utf-8")
+    renderer = QSvgRenderer(svg_data)
+    if not renderer.isValid():
+        return QIcon()
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pixmap)
 
 class LineNumberArea(QWidget):
     def __init__(self, editor):
@@ -1625,6 +1715,7 @@ class MainWindow(QMainWindow):
     def create_toolbar(self):
         toolbar = QToolBar("Formatting")
         toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
         
         self.toolbar_spacer = QWidget()
@@ -1641,50 +1732,97 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        self.act_bold = QAction("B", self); self.act_bold.setCheckable(True)
+        self.act_bold = QAction("", self); self.act_bold.setCheckable(True)
+        self.act_bold.setToolTip("Bold")
         self.act_bold.triggered.connect(self.toggle_bold)
         toolbar.addAction(self.act_bold)
 
-        self.act_italic = QAction("I", self); self.act_italic.setCheckable(True)
+        self.act_italic = QAction("", self); self.act_italic.setCheckable(True)
+        self.act_italic.setToolTip("Italic")
         self.act_italic.triggered.connect(self.toggle_italic)
         toolbar.addAction(self.act_italic)
 
-        self.act_underline = QAction("U", self); self.act_underline.setCheckable(True)
+        self.act_underline = QAction("", self); self.act_underline.setCheckable(True)
+        self.act_underline.setToolTip("Underline")
         self.act_underline.triggered.connect(self.toggle_underline)
         toolbar.addAction(self.act_underline)
 
-        self.act_code = QAction("Code", self); self.act_code.setCheckable(True)
+        self.act_code = QAction("", self); self.act_code.setCheckable(True)
+        self.act_code.setToolTip("Inline code")
         self.act_code.triggered.connect(self.toggle_code)
         toolbar.addAction(self.act_code)
 
-        self.act_quote = QAction("Quote", self); self.act_quote.setCheckable(True)
+        self.act_quote = QAction("", self); self.act_quote.setCheckable(True)
+        self.act_quote.setToolTip("Quote block")
         self.act_quote.triggered.connect(self.toggle_quote)
         toolbar.addAction(self.act_quote)
 
         toolbar.addSeparator()
 
-        self.act_ul = QAction("UL", self); self.act_ul.setCheckable(True)
+        self.act_ul = QAction("", self); self.act_ul.setCheckable(True)
+        self.act_ul.setToolTip("Bulleted list")
         self.act_ul.triggered.connect(lambda: self.toggle_list("ul"))
         toolbar.addAction(self.act_ul)
 
-        self.act_ol = QAction("OL", self); self.act_ol.setCheckable(True)
+        self.act_ol = QAction("", self); self.act_ol.setCheckable(True)
+        self.act_ol.setToolTip("Numbered list")
         self.act_ol.triggered.connect(lambda: self.toggle_list("ol"))
         toolbar.addAction(self.act_ol)
 
-        self.act_table = QAction("Table", self)
+        self.act_table = QAction("", self)
+        self.act_table.setToolTip("Insert table")
         self.act_table.triggered.connect(self.insert_table)
         toolbar.addAction(self.act_table)
 
-        self.act_hr = QAction("Line", self)
+        self.act_hr = QAction("", self)
         self.act_hr.setToolTip("Insert horizontal line (---)")
         self.act_hr.triggered.connect(self.insert_horizontal_line)
         toolbar.addAction(self.act_hr)
 
         toolbar.addSeparator()
 
-        self.act_link = QAction("Link", self); self.act_link.setCheckable(True)
+        self.act_link = QAction("", self); self.act_link.setCheckable(True)
+        self.act_link.setToolTip("Insert / edit link")
         self.act_link.triggered.connect(self.insert_link)
         toolbar.addAction(self.act_link)
+
+        # Icons are tinted to the current theme's toolbar text color, so
+        # collect the actions once here and reuse this map to re-tint them
+        # if the theme changes later (see refresh_toolbar_icons()).
+        self._icon_actions = {
+            "bold": self.act_bold, "italic": self.act_italic, "underline": self.act_underline,
+            "code": self.act_code, "quote": self.act_quote, "ul": self.act_ul, "ol": self.act_ol,
+            "table": self.act_table, "line": self.act_hr, "link": self.act_link,
+        }
+        self.refresh_toolbar_icons()
+
+        # All formatting buttons (bold/italic/underline/code/quote/ul/ol/
+        # table/line/link) are icon-only, same as before this only applied
+        # to B/I/U. Every toolbar button - the H1-H6 buttons and all the
+        # icon buttons - is then forced to one identical square size, so
+        # the whole row reads as one uniform grid instead of a ragged mix
+        # of narrow and wide buttons.
+        format_buttons = [toolbar.widgetForAction(a) for a in self._icon_actions.values()]
+        format_buttons = [b for b in format_buttons if b is not None]
+        for b in format_buttons:
+            b.setToolButtonStyle(Qt.ToolButtonIconOnly)
+
+        h_buttons = [toolbar.widgetForAction(a) for a in self.h_actions.values()]
+        h_buttons = [b for b in h_buttons if b is not None]
+
+        all_buttons = h_buttons + format_buttons
+        if all_buttons:
+            button_size = max(max(b.sizeHint().width(), b.sizeHint().height()) for b in all_buttons)
+            for b in all_buttons:
+                b.setFixedSize(button_size, button_size)
+
+    def refresh_toolbar_icons(self):
+        """(Re)apply SVG icons to the formatting toolbar, tinted to the
+        current theme's text color. Safe to call any time the theme
+        changes, and a no-op (blank icons) if QtSvg isn't installed."""
+        color = self.settings.get("app_text", "#d4d4d4")
+        for name, action in self._icon_actions.items():
+            action.setIcon(make_svg_icon(name, color, size=20))
 
     def update_toolbar_margin(self):
         editor = self.tab_widget.currentWidget()
@@ -2997,7 +3135,9 @@ class MainWindow(QMainWindow):
         if mode == "plain":
             # Show the exact markdown source that File > Save would write,
             # in a flat, uncolored style - no rich formatting to keep in
-            # sync while the user edits raw syntax directly.
+            # sync while the user edits raw syntax directly. This mirrors
+            # a plain text editor like Notepad++: what's on screen here
+            # is exactly what's on disk, syntax characters included.
             md_text = self.export_markdown(editor)
             editor.setPlainText(md_text)
 
@@ -3077,6 +3217,7 @@ class MainWindow(QMainWindow):
             self.settings.update(dialog.get_settings())
             self.save_settings()
             self.apply_app_theme()
+            self.refresh_toolbar_icons()
             
             for i in range(self.tab_widget.count()):
                 editor = self.tab_widget.widget(i)
