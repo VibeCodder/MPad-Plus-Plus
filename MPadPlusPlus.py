@@ -117,6 +117,14 @@ CODE_PROP = QTextFormat.UserProperty + 1
 QUOTE_PROP = QTextFormat.UserProperty + 2
 BLOCK_CODE_PROP = QTextFormat.UserProperty + 3
 HR_PROP = QTextFormat.UserProperty + 4
+# Per-table text alignment OVERRIDE, set from a specific table's "Edit
+# Table" dialog (see MainWindow.open_table_editor()) and stored on that
+# QTextTableFormat. When absent, apply_table_style() falls back to the
+# app-wide default set in Preferences > General (settings keys
+# "table_header_align"/"table_row_align") - so alignment is global by
+# default, but any individual table can opt out and pick its own.
+TABLE_HEADER_ALIGN_PROP = QTextFormat.UserProperty + 5
+TABLE_ROW_ALIGN_PROP = QTextFormat.UserProperty + 6
 
 # --- Toolbar icons ---
 # Simple, original monoline glyphs (20x20 viewBox). "{color}" is filled in
@@ -820,40 +828,65 @@ class Editor(QTextEdit):
         painter.fillRect(event.rect(), QColor(self.settings['editor_bg']).darker(110))
 
         # QTextDocumentLayout caches each block's bounding rect and only
-        # recomputes it lazily, on its own schedule. Right after a table's
-        # structure or content changes (row/col added, text typed into a
-        # cell), that cache can be stale for a moment: blocks *after* the
-        # table still report their old (pre-change) position, so their
-        # rect overlaps the table's rows instead of sitting below them.
-        # The gutter below relies on each block's top position to decide
-        # when a new line number starts, so a stale rect makes it hand out
-        # numbers to the wrong blocks - exactly the "misaligned numbering
-        # around tables" symptom. Touching documentSize() forces Qt to
-        # finish any pending layout pass before we read a single rect, so
-        # every position below is current.
+        # recomputes it lazily, on its own schedule. Touching documentSize()
+        # forces Qt to finish any pending layout pass before we read a
+        # single rect below, so every position is current.
         self.document().documentLayout().documentSize()
 
-        block = self.document().firstBlock()
-        block_number = 0
         viewport_height = self.viewport().height()
-        prev_top = -9999
-        
+        fm_height = self.fontMetrics().height()
+        scroll_y = self.verticalScrollBar().value()
+        painter.setPen(QColor("#858585"))
+
+        def draw(top, number):
+            if top + fm_height >= 0 and top <= viewport_height:
+                painter.drawText(0, int(top), self.line_number_area.width() - 5, fm_height,
+                                 Qt.AlignRight | Qt.AlignVCenter, str(number))
+
+        block_number = 0
+        block = self.document().firstBlock()
+
         while block.isValid():
+            table = QTextCursor(block).currentTable()
+
+            if table is not None:
+                # A table's cells are each their own block, visited once per
+                # CELL in document order - naively walking block.next() over
+                # them hands out a separate gutter number per cell instead
+                # of per row (the "1/2" then "4/5" split seen around a
+                # 3-column table). blockBoundingRect() also can't be
+                # trusted for these blocks: it's expressed in the cell's
+                # own local coordinate system, not the document's, which is
+                # what caused the actual vertical misalignment. cursorRect()
+                # resolves the correct on-screen position for a cursor
+                # anywhere in the document - including inside table cells -
+                # without manual coordinate math, so it's used here to number
+                # the table exactly once per row (column 0 of each row),
+                # then the whole table is skipped in one jump.
+                last_top = 0
+                for r in range(table.rows()):
+                    row_cursor = QTextCursor(self.document())
+                    row_cursor.setPosition(table.cellAt(r, 0).firstPosition())
+                    last_top = self.cursorRect(row_cursor).top()
+                    block_number += 1
+                    draw(last_top, block_number)
+
+                if last_top > viewport_height:
+                    break
+
+                block = self.document().findBlock(table.lastPosition() + 1)
+                continue
+
             rect = self.document().documentLayout().blockBoundingRect(block)
-            top = int(rect.top() - self.verticalScrollBar().value())
-            bottom = int(rect.bottom() - self.verticalScrollBar().value())
-            
+            top = rect.top() - scroll_y
+
             if top > viewport_height:
                 break
-                
-            if block.isVisible() and bottom > 0:
-                if top - prev_top > 2:
-                    block_number += 1
-                    prev_top = top
-                    painter.setPen(QColor("#858585"))
-                    painter.drawText(0, top, self.line_number_area.width() - 5, self.fontMetrics().height(),
-                                     Qt.AlignRight | Qt.AlignVCenter, str(block_number))
-                
+
+            if block.isVisible():
+                block_number += 1
+                draw(top, block_number)
+
             block = block.next()
 
     def update_table_button(self):
@@ -1586,8 +1619,19 @@ class Editor(QTextEdit):
             "center": Qt.AlignHCenter,
             "right": Qt.AlignRight,
         }
-        header_align = align_map.get(self.settings.get("table_header_align", "left"), Qt.AlignLeft)
-        row_align = align_map.get(self.settings.get("table_row_align", "left"), Qt.AlignLeft)
+        # Alignment is per-table (set from Edit Table, not the app-wide
+        # Settings dialog). Fall back to the old global default for tables
+        # that don't have their own value yet (e.g. freshly opened files).
+        if table_fmt.hasProperty(TABLE_HEADER_ALIGN_PROP):
+            header_align_key = table_fmt.property(TABLE_HEADER_ALIGN_PROP)
+        else:
+            header_align_key = self.settings.get("table_header_align", "left")
+        if table_fmt.hasProperty(TABLE_ROW_ALIGN_PROP):
+            row_align_key = table_fmt.property(TABLE_ROW_ALIGN_PROP)
+        else:
+            row_align_key = self.settings.get("table_row_align", "left")
+        header_align = align_map.get(header_align_key, Qt.AlignLeft)
+        row_align = align_map.get(row_align_key, Qt.AlignLeft)
 
         for r in range(rows):
             for c in range(cols):
@@ -1771,9 +1815,10 @@ class SettingsDialog(QDialog):
         self.add_color_picker(layout, "Row 1 (background)", "table_row1_bg")
         self.add_color_picker(layout, "Row 2 (background)", "table_row2_bg")
 
+        # Text alignment moved to the per-table "Edit Table" dialog (see
+        # MainWindow.open_table_editor()) so each table can set its own,
+        # instead of one alignment for every table in every document.
         self.align_combos = {}
-        self.add_alignment_setting(layout, "First row text alignment", "table_header_align")
-        self.add_alignment_setting(layout, "Other rows text alignment", "table_row_align")
 
         layout.addRow(QLabel("--- Tab Colors ---"))
         self.add_color_picker(layout, "Active tab (background)", "tab_active_bg")
@@ -1898,6 +1943,27 @@ class PreferencesDialog(QDialog):
 
         layout.addRow("New line (character):", line_break_widget)
 
+        # Default table text alignment - applies to any table that hasn't
+        # been given its own alignment via that table's "Edit Table" dialog
+        # (see MainWindow.open_table_editor()), so this is the app-wide
+        # default while individual tables can still opt out and pick their
+        # own alignment locally.
+        self.align_combos = {}
+
+        def make_align_combo(settings_key):
+            combo = QComboBox()
+            combo.addItem("Left", "left")
+            combo.addItem("Center", "center")
+            combo.addItem("Right", "right")
+            current = self.settings.get(settings_key, "left")
+            idx = combo.findData(current)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.align_combos[settings_key] = combo
+            return combo
+
+        layout.addRow("Default first row alignment:", make_align_combo("table_header_align"))
+        layout.addRow("Default other rows alignment:", make_align_combo("table_row_align"))
+
         self.tabs.addTab(general_tab, "General")
 
         # --- Spell Check tab ---
@@ -2004,6 +2070,9 @@ class PreferencesDialog(QDialog):
             if radio.isChecked():
                 self.settings["line_break_style"] = value
                 break
+
+        for key, combo in self.align_combos.items():
+            self.settings[key] = combo.currentData()
 
         selected_langs = [code for code, check in self.spell_lang_checks.items() if check.isChecked()]
         if selected_langs:
@@ -3600,7 +3669,41 @@ class MainWindow(QMainWindow):
             editor.style_tables()
         btn_del_col.clicked.connect(del_col)
         layout.addWidget(btn_del_col)
-        
+
+        # Text alignment - per-TABLE override (stored on this table's own
+        # format via TABLE_HEADER_ALIGN_PROP/TABLE_ROW_ALIGN_PROP). The
+        # app-wide default lives in Preferences > General and is what a
+        # table uses until this combo is changed for it specifically.
+        align_row = QWidget()
+        align_form = QFormLayout(align_row)
+        align_form.setContentsMargins(0, 0, 0, 0)
+
+        table_fmt = table.format()
+
+        def make_align_combo(prop, settings_key):
+            combo = QComboBox()
+            combo.addItem("Left", "left")
+            combo.addItem("Center", "center")
+            combo.addItem("Right", "right")
+            current = table_fmt.property(prop) if table_fmt.hasProperty(prop) \
+                else self.settings.get(settings_key, "left")
+            idx = combo.findData(current)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+            def on_change(_, prop=prop):
+                fmt = table.format()
+                fmt.setProperty(prop, combo.currentData())
+                table.setFormat(fmt)
+                editor.style_tables()
+            combo.currentIndexChanged.connect(on_change)
+            return combo
+
+        align_form.addRow("First row text alignment:",
+                           make_align_combo(TABLE_HEADER_ALIGN_PROP, "table_header_align"))
+        align_form.addRow("Other rows text alignment:",
+                           make_align_combo(TABLE_ROW_ALIGN_PROP, "table_row_align"))
+        layout.addWidget(align_row)
+
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(dialog.accept)
         layout.addWidget(btn_close)
@@ -4013,6 +4116,16 @@ class MainWindow(QMainWindow):
             # in-memory state (and reload/rehighlight) to match.
             self.spell_manager.set_custom_words(self.settings.get("spellcheck_custom_words", []))
             self.spell_manager.set_languages(self.settings.get("spellcheck_langs", ["pl_PL"]))
+
+            # Re-apply table styling in every open tab so a changed default
+            # alignment shows immediately on tables that haven't been given
+            # their own alignment via Edit Table (apply_table_style() only
+            # falls back to this default for tables without that override,
+            # so tables customized locally are left alone).
+            for i in range(self.tab_widget.count()):
+                editor = self.tab_widget.widget(i)
+                editor.settings = self.settings
+                editor.style_tables()
 
 
 if __name__ == "__main__":
