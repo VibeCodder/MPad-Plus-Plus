@@ -1037,15 +1037,22 @@ class Editor(QTextEdit):
                         fmt.setForeground(QColor(self.settings[f"h{level}"]))
                         size = self.settings.get(f"h{level}_size", 0)
                         if size == 0: size = self.settings["font_size"]
+                        fmt.setFontFamilies([self.settings['font_family']])
                         fmt.setFontPointSize(size)
                         fmt.setFontWeight(QFont.Bold)
                         changed = True
                     elif is_quote:
                         fmt.setForeground(QColor(self.settings['quote']))
+                        size = self.settings.get('quote_size', 0)
+                        if size == 0: size = self.settings["font_size"]
+                        fmt.setFontFamilies([self.settings['font_family']])
+                        fmt.setFontPointSize(size)
                         fmt.setFontItalic(True)
                         changed = True
                     else:
                         fmt.setForeground(QColor(self.settings['editor_text']))
+                        fmt.setFontFamilies([self.settings['font_family']])
+                        fmt.setFontPointSize(self.settings['font_size'])
                         changed = True
                         if is_bold:
                             fmt.setForeground(QColor(self.settings['bold']))
@@ -1583,7 +1590,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("MPad++")
         self.resize(800, 600)
         
-        icon_path = os.path.join("icons", "notepad.ico")
+        icon_path = os.path.join("icons", "notepad_yellow_icon.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
@@ -3247,7 +3254,7 @@ if __name__ == "__main__":
     # Windows can re-sync style hints from the system theme later on.
     app.setCursorFlashTime(0)
 
-    icon_path = os.path.join("icons", "notepad.ico")
+    icon_path = os.path.join("icons", "notepad_yellow_icon.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
         
