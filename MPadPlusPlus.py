@@ -8,13 +8,16 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout
                                QLabel, QLineEdit, QDialogButtonBox, QColorDialog, 
                                QPushButton, QFormLayout, QSpinBox, QFontDialog, 
                                QMessageBox, QFileDialog, QMenu, QToolButton, QCheckBox,
-                               QTabWidget, QSizePolicy, QScrollArea, QPlainTextEdit,
-                               QRadioButton, QButtonGroup)
+                               QTabWidget, QTabBar, QSizePolicy, QScrollArea, QPlainTextEdit,
+                               QRadioButton, QButtonGroup, QListWidget, QListWidgetItem,
+                               QComboBox)
 from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListFormat,
                            QKeySequence, QShortcut, QFont, QPalette,
                            QAction, QActionGroup, QTextCursor, QDragEnterEvent, QDropEvent, 
-                           QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon, QPixmap)
-from PySide6.QtCore import QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect, QRectF, QTimer
+                           QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon, QPixmap,
+                           QSyntaxHighlighter, QTextTableFormat, QTextLength, QTextFrameFormat)
+from PySide6.QtCore import (QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect, QRectF,
+                            QTimer, QObject, QThread, Signal)
 
 try:
     from PySide6.QtSvg import QSvgRenderer
@@ -23,12 +26,49 @@ except ImportError:
     # optional QtSvg module isn't installed alongside PySide6.
     QSvgRenderer = None
 
+try:
+    import phunspell
+except ImportError:
+    # Spell checking degrades gracefully (feature disabled, with an
+    # explanatory tooltip in the Spelling menu) if the optional
+    # 'phunspell' package isn't installed. Install with: pip install phunspell
+    phunspell = None
+
+# --- Spell checking ---
+# (display name, phunspell locale code). phunspell bundles Hunspell
+# dictionaries for all of these out of the box.
+SPELLCHECK_LANGUAGES = [
+    ("English (US)", "en_US"),
+    ("English (UK)", "en_GB"),
+    ("Polski", "pl_PL"),
+    ("Deutsch", "de_DE"),
+    ("Français", "fr_FR"),
+    ("Español", "es"),
+    ("Italiano", "it_IT"),
+    ("Português (PT)", "pt_PT"),
+    ("Português (BR)", "pt_BR"),
+    ("Русский", "ru_RU"),
+    ("Українська", "uk_UA"),
+    ("Nederlands", "nl_NL"),
+    ("Čeština", "cs_CZ"),
+    ("Svenska", "sv_SE"),
+]
+
+# Matches "words" for spell-check purposes: runs of Unicode letters
+# (so Polish ąćęłńóśźż etc. are included, digits/underscore are not),
+# optionally joined by a single internal apostrophe or hyphen so
+# contractions and hyphenated words ("don't", "wielko-formatowy")
+# aren't split into bogus fragments.
+SPELLCHECK_WORD_RE = re.compile(r"[^\W\d_]+(?:['\u2019-][^\W\d_]+)*", re.UNICODE)
+
+
 # --- Default settings ---
 DEFAULT_SETTINGS = {
     "app_bg": "#1e1e1e",
     "app_text": "#d4d4d4",
     "editor_bg": "#1e1e1e",
     "editor_text": "#d4d4d4",
+    "current_line_highlight": "#2a2a2a",
     "font_family": "Consolas",
     "font_size": 12,
     
@@ -55,6 +95,8 @@ DEFAULT_SETTINGS = {
     "table_header_text": "#FFFFFF",
     "table_row1_bg": "#252526",
     "table_row2_bg": "#2d2d2d",
+    "table_header_align": "left",
+    "table_row_align": "left",
     
     "tab_active_bg": "#1e1e1e",
     "tab_inactive_bg": "#2d2d2d",
@@ -63,7 +105,12 @@ DEFAULT_SETTINGS = {
     # How a Shift+Enter soft line break (within the same paragraph) is
     # written to Markdown on save. One of: "br" (<br/>), "double_space"
     # (two trailing spaces + newline), "backslash" (\ + newline).
-    "line_break_style": "double_space"
+    "line_break_style": "double_space",
+
+    # Spell checking
+    "spellcheck_enabled": False,
+    "spellcheck_langs": ["pl_PL"],
+    "spellcheck_custom_words": [],
 }
 
 CODE_PROP = QTextFormat.UserProperty + 1
@@ -134,6 +181,17 @@ TOOLBAR_SVG_ICONS = {
                 d="M8.2 11.8 11.8 8.2 M7.8 5.9l1.2-1.2a3 3 0 0 1 4.3 4.3l-1.2 1.2
                    M12.2 14.1 11 15.3a3 3 0 0 1-4.3-4.3l1.2-1.2"/>
         </svg>""",
+    "spellcheck": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <text x="1" y="12.5" font-family="sans-serif" font-size="11" font-weight="bold" fill="{color}">Aa</text>
+          <path fill="none" stroke="#ff5555" stroke-width="1.6" stroke-linecap="round"
+                d="M2 16.3q1.1-1.5 2.3 0t2.3 0 2.3 0 2.3 0 2.3 0 2.3 0"/>
+        </svg>""",
+    "close": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <path fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"
+                d="M5.5 5.5 14.5 14.5 M14.5 5.5 5.5 14.5"/>
+        </svg>""",
 }
 
 
@@ -164,6 +222,281 @@ class LineNumberArea(QWidget):
 
     def paintEvent(self, event):
         self.editor.line_number_area_paint_event(event)
+
+
+class _DictionaryLoaderThread(QThread):
+    """Builds a phunspell.Phunspell() dictionary object off the UI thread.
+    Parsing the .dic/.aff files takes a noticeable fraction of a second
+    (longer for the first, large languages), which would otherwise cause a
+    visible freeze the first time spell check is enabled or the language
+    is changed."""
+    loaded = Signal(str, object)
+
+    def __init__(self, lang_code, parent=None):
+        super().__init__(parent)
+        self.lang_code = lang_code
+
+    def run(self):
+        try:
+            dictionary = phunspell.Phunspell(self.lang_code)
+        except Exception:
+            dictionary = None
+        self.loaded.emit(self.lang_code, dictionary)
+
+
+class _SuggestionLoaderThread(QThread):
+    """Computes spelling suggestions for one word off the UI thread.
+    phunspell.suggest() walks the whole loaded dictionary computing edit
+    distances, which can take a noticeable moment (worse with several
+    languages active) - running it synchronously inside
+    Editor.contextMenuEvent is what made the right-click menu feel slow
+    to appear."""
+    ready = Signal(str, list)
+
+    def __init__(self, word, dictionaries, limit=6, parent=None):
+        super().__init__(parent)
+        self.word = word
+        self.dictionaries = dictionaries
+        self.limit = limit
+
+    def run(self):
+        results = []
+        for dictionary in self.dictionaries:
+            try:
+                for suggestion in dictionary.suggest(self.word):
+                    if suggestion not in results:
+                        results.append(suggestion)
+                    if len(results) >= self.limit:
+                        break
+            except Exception:
+                continue
+            if len(results) >= self.limit:
+                break
+        self.ready.emit(self.word, results)
+
+
+class SpellCheckManager(QObject):
+    """Owns the spell-check state (on/off, active languages, loaded
+    dictionaries, personal dictionary) shared by every open Editor tab, so
+    all tabs stay in sync and each dictionary is only ever loaded once.
+
+    Multiple languages can be active at once (e.g. Polish + English in the
+    same document): a word is considered correct if it's found in ANY of
+    the enabled languages' dictionaries, or in the user's personal
+    dictionary.
+
+    `settings` is the same dict the rest of the app reads/writes and gets
+    persisted via MainWindow.save_settings(), so enabled/languages/custom
+    words survive a restart without any separate storage."""
+
+    dictionary_changed = Signal()
+    suggestions_ready = Signal(str, list)
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.available = phunspell is not None
+        self._dictionaries = {}   # lang_code -> Phunspell instance or None (failed)
+        self._loading = set()     # lang_codes currently loading in a thread
+        self._threads = []
+        self._suggestion_cache = {}    # (lang_codes, word_lower) -> list[str]
+        self._suggestion_threads = []
+        self.custom_words = set(w.lower() for w in settings.get("spellcheck_custom_words", []))
+
+    @property
+    def enabled(self):
+        return self.available and bool(self.settings.get("spellcheck_enabled", False))
+
+    @property
+    def lang_codes(self):
+        codes = self.settings.get("spellcheck_langs")
+        if not codes:
+            # Backward compatibility with the earlier single-language setting.
+            legacy = self.settings.get("spellcheck_lang")
+            codes = [legacy] if legacy else ["en_US"]
+        return list(codes)
+
+    def set_enabled(self, value):
+        self.settings["spellcheck_enabled"] = bool(value)
+        if value:
+            for code in self.lang_codes:
+                self._ensure_loaded(code)
+        self.dictionary_changed.emit()
+
+    def set_languages(self, lang_codes):
+        lang_codes = list(lang_codes) or ["en_US"]
+        self.settings["spellcheck_langs"] = lang_codes
+        if self.enabled:
+            for code in lang_codes:
+                self._ensure_loaded(code)
+        self.dictionary_changed.emit()
+
+    def is_language_active(self, lang_code):
+        return lang_code in self.lang_codes
+
+    def _ensure_loaded(self, lang_code):
+        if not self.available or lang_code in self._dictionaries or lang_code in self._loading:
+            return
+        self._loading.add(lang_code)
+        self._threads = [t for t in self._threads if t.isRunning()]
+        thread = _DictionaryLoaderThread(lang_code, self)
+        thread.loaded.connect(self._on_dictionary_loaded)
+        self._threads.append(thread)
+        thread.start()
+
+    def _on_dictionary_loaded(self, lang_code, dictionary):
+        self._dictionaries[lang_code] = dictionary
+        self._loading.discard(lang_code)
+        self.dictionary_changed.emit()
+
+    def current_dictionaries(self):
+        """Every loaded dictionary for the currently active language(s).
+        Triggers a background load for any active language not loaded yet."""
+        if not self.enabled:
+            return []
+        dictionaries = []
+        for code in self.lang_codes:
+            dic = self._dictionaries.get(code)
+            if dic is None and code not in self._loading:
+                self._ensure_loaded(code)
+            if dic is not None:
+                dictionaries.append(dic)
+        return dictionaries
+
+    def is_custom_word(self, word):
+        return word.lower() in self.custom_words
+
+    def add_custom_word(self, word):
+        """Permanently add `word` to the user's personal dictionary (it
+        will never be flagged as misspelled again), persisted in settings
+        and manageable later via Preferences."""
+        self.custom_words.add(word.lower())
+        self.settings["spellcheck_custom_words"] = sorted(self.custom_words)
+        self.dictionary_changed.emit()
+
+    def remove_custom_word(self, word):
+        self.custom_words.discard(word.lower())
+        self.settings["spellcheck_custom_words"] = sorted(self.custom_words)
+        self.dictionary_changed.emit()
+
+    def set_custom_words(self, words):
+        self.custom_words = set(w.lower() for w in words)
+        self.settings["spellcheck_custom_words"] = sorted(self.custom_words)
+        self.dictionary_changed.emit()
+
+    def is_correct(self, word):
+        if self.is_custom_word(word):
+            return True
+        dictionaries = self.current_dictionaries()
+        if not dictionaries:
+            # No dictionary available/loaded yet: don't flag anything as
+            # wrong until we can actually check it (avoids a flash of
+            # false positives while a dictionary loads in the background).
+            return True
+        for dictionary in dictionaries:
+            try:
+                if dictionary.lookup(word):
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def suggestions(self, word, limit=6):
+        results = []
+        for dictionary in self.current_dictionaries():
+            try:
+                for suggestion in dictionary.suggest(word):
+                    if suggestion not in results:
+                        results.append(suggestion)
+                    if len(results) >= limit:
+                        return results
+            except Exception:
+                continue
+        return results
+
+    def _suggestion_cache_key(self, word):
+        return (tuple(sorted(self.lang_codes)), word.lower())
+
+    def suggestions_cached(self, word):
+        """Returns already-computed suggestions for `word` if we have them,
+        or None if they haven't been fetched yet. Never blocks."""
+        return self._suggestion_cache.get(self._suggestion_cache_key(word))
+
+    def request_suggestions(self, word, limit=6):
+        """Non-blocking counterpart to suggestions(): returns cached
+        suggestions immediately if available, otherwise kicks off a
+        background computation and returns None. `suggestions_ready`
+        fires with the same word once that background thread finishes,
+        so callers (the right-click menu) can open instantly with a
+        placeholder instead of freezing while phunspell searches its
+        dictionary, then fill in the real list a moment later."""
+        key = self._suggestion_cache_key(word)
+        cached = self._suggestion_cache.get(key)
+        if cached is not None:
+            return cached
+        self._suggestion_threads = [t for t in self._suggestion_threads if t.isRunning()]
+        thread = _SuggestionLoaderThread(word, self.current_dictionaries(), limit, self)
+        thread.ready.connect(lambda w, results, k=key: self._on_suggestions_ready(k, results))
+        self._suggestion_threads.append(thread)
+        thread.start()
+        return None
+
+    def _on_suggestions_ready(self, key, results):
+        self._suggestion_cache[key] = results
+        self.suggestions_ready.emit(key[1], results)
+
+    def shutdown(self):
+        """Stop cleanly on app exit so no background QThread outlives
+        the SpellCheckManager (which would print a Qt warning / risk a
+        crash on interpreter shutdown)."""
+        for thread in self._threads:
+            thread.wait(2000)
+        for thread in self._suggestion_threads:
+            thread.wait(2000)
+
+
+class SpellCheckHighlighter(QSyntaxHighlighter):
+    """Underlines words not found in the active dictionary with a red
+    wavy line, the same way as in Word/most text editors. Attached to
+    one Editor's document; Editor connects SpellCheckManager's
+    dictionary_changed signal to rehighlight() so every open tab updates
+    together when spell check is toggled, the language changes, a
+    dictionary finishes loading, or a word is added/ignored."""
+
+    def __init__(self, document, editor):
+        super().__init__(document)
+        self.editor = editor
+        self._format = QTextCharFormat()
+        self._format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.WaveUnderline)
+        self._format.setUnderlineColor(QColor("#ff3333"))
+
+    def highlightBlock(self, text):
+        window = self.editor.window()
+        manager = getattr(window, "spell_manager", None)
+        if manager is None or not manager.enabled:
+            return
+
+        block = self.currentBlock()
+        block_fmt = block.blockFormat()
+        if block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True:
+            return  # skip code blocks entirely
+
+        doc = self.document()
+        probe = QTextCursor(doc)
+        for match in SPELLCHECK_WORD_RE.finditer(text):
+            word = match.group()
+            if len(word) < 2:
+                continue
+
+            # Skip inline code and hyperlinks - neither should be flagged
+            # as misspelled (code identifiers and URLs rarely are words).
+            probe.setPosition(block.position() + match.start() + 1)
+            cf = probe.charFormat()
+            if cf.isAnchor() or (cf.hasProperty(CODE_PROP) and cf.property(CODE_PROP) == True):
+                continue
+
+            if not manager.is_correct(word):
+                self.setFormat(match.start(), len(word), self._format)
 
 
 class Editor(QTextEdit):
@@ -242,6 +575,12 @@ class Editor(QTextEdit):
         self.update_line_number_area_width()
         self.highlight_current_line()
         self.setMouseTracking(True)
+
+        # --- Spell checking ---
+        self.spell_highlighter = SpellCheckHighlighter(self.document(), self)
+        spell_manager = getattr(self.window(), "spell_manager", None)
+        if spell_manager is not None:
+            spell_manager.dictionary_changed.connect(self.spell_highlighter.rehighlight)
 
     def _toggle_caret(self):
         self._caret_visible = not self._caret_visible
@@ -368,7 +707,7 @@ class Editor(QTextEdit):
         # Using ExtraSelection for this caused a Windows-specific bug where Qt
         # rendered the cursor in the selection's default foreground (black),
         # making it invisible on the dark background.
-        line_color = QColor(self.settings['editor_bg']).lighter(115)
+        line_color = QColor(self.settings['current_line_highlight'])
         cursor_block = self.textCursor().block()
         if cursor_block.isValid():
             block_rect = self.document().documentLayout().blockBoundingRect(cursor_block)
@@ -479,7 +818,21 @@ class Editor(QTextEdit):
     def line_number_area_paint_event(self, event):
         painter = QPainter(self.line_number_area)
         painter.fillRect(event.rect(), QColor(self.settings['editor_bg']).darker(110))
-        
+
+        # QTextDocumentLayout caches each block's bounding rect and only
+        # recomputes it lazily, on its own schedule. Right after a table's
+        # structure or content changes (row/col added, text typed into a
+        # cell), that cache can be stale for a moment: blocks *after* the
+        # table still report their old (pre-change) position, so their
+        # rect overlaps the table's rows instead of sitting below them.
+        # The gutter below relies on each block's top position to decide
+        # when a new line number starts, so a stale rect makes it hand out
+        # numbers to the wrong blocks - exactly the "misaligned numbering
+        # around tables" symptom. Touching documentSize() forces Qt to
+        # finish any pending layout pass before we read a single rect, so
+        # every position below is current.
+        self.document().documentLayout().documentSize()
+
         block = self.document().firstBlock()
         block_number = 0
         viewport_height = self.viewport().height()
@@ -579,6 +932,34 @@ class Editor(QTextEdit):
         run.setPosition(end_pos, QTextCursor.KeepAnchor)
         return run
 
+    def _spellcheck_word_at(self, position):
+        """Return (word, start_pos, end_pos) for the misspelled word under
+        `position`, or (None, None, None) if that spot isn't a misspelled
+        word (or spell check is off)."""
+        spell_manager = getattr(self.window(), "spell_manager", None)
+        if spell_manager is None or not spell_manager.enabled:
+            return None, None, None
+        block = self.document().findBlock(position)
+        offset = position - block.position()
+        for match in SPELLCHECK_WORD_RE.finditer(block.text()):
+            if match.start() <= offset <= match.end():
+                word = match.group()
+                if len(word) >= 2 and not spell_manager.is_correct(word):
+                    return word, block.position() + match.start(), block.position() + match.end()
+                return None, None, None
+        return None, None, None
+
+    def _replace_spelling(self, start, end, replacement):
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        cursor.insertText(replacement)
+
+    def _add_word_to_dictionary(self, word):
+        spell_manager = getattr(self.window(), "spell_manager", None)
+        if spell_manager is not None:
+            spell_manager.add_custom_word(word)
+
     def contextMenuEvent(self, event):
         click_pos = self.cursorForPosition(event.pos()).position()
         cursor = self.cursorForPosition(event.pos())
@@ -592,7 +973,87 @@ class Editor(QTextEdit):
                     cursor = temp
                     fmt = temp.charFormat()
 
+        misspelled_word, ms_start, ms_end = self._spellcheck_word_at(click_pos)
+
         menu = self.createStandardContextMenu()
+
+        if misspelled_word is not None:
+            spell_manager = self.window().spell_manager
+            prepend_actions = []
+
+            suggestions = spell_manager.suggestions_cached(misspelled_word)
+            if suggestions is None:
+                # Not computed yet: don't block menu-opening on phunspell's
+                # dictionary search (which is what made this menu feel slow
+                # to appear). Show a placeholder now and fill in the real
+                # suggestions in place once the background thread finishes -
+                # menu.exec() below runs its own event loop, so the queued
+                # signal can still update this menu while it's open.
+                loading_action = QAction("Loading suggestions…", menu)
+                loading_action.setEnabled(False)
+                prepend_actions.append(loading_action)
+
+                def _on_bg_suggestions(word, results, target_word=misspelled_word,
+                                        ph=loading_action, target_menu=menu,
+                                        a=ms_start, b=ms_end, mgr=spell_manager):
+                    if word != target_word:
+                        return
+                    try:
+                        mgr.suggestions_ready.disconnect(_on_bg_suggestions)
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        if not target_menu.isVisible():
+                            return
+                    except RuntimeError:
+                        return  # menu already closed/destroyed
+                    new_actions = []
+                    if results:
+                        for suggestion in results:
+                            action = QAction(suggestion, target_menu)
+                            bold_font = action.font()
+                            bold_font.setBold(True)
+                            action.setFont(bold_font)
+                            action.triggered.connect(
+                                lambda checked=False, s=suggestion, a=a, b=b: self._replace_spelling(a, b, s))
+                            new_actions.append(action)
+                    else:
+                        no_suggestions_action = QAction("(no suggestions)", target_menu)
+                        no_suggestions_action.setEnabled(False)
+                        new_actions.append(no_suggestions_action)
+                    target_menu.insertActions(ph, new_actions)
+                    target_menu.removeAction(ph)
+
+                spell_manager.suggestions_ready.connect(_on_bg_suggestions)
+                spell_manager.request_suggestions(misspelled_word)
+            elif suggestions:
+                for suggestion in suggestions:
+                    action = QAction(suggestion, menu)
+                    bold_font = action.font()
+                    bold_font.setBold(True)
+                    action.setFont(bold_font)
+                    action.triggered.connect(
+                        lambda checked=False, s=suggestion, a=ms_start, b=ms_end: self._replace_spelling(a, b, s))
+                    prepend_actions.append(action)
+            else:
+                no_suggestions_action = QAction("(no suggestions)", menu)
+                no_suggestions_action.setEnabled(False)
+                prepend_actions.append(no_suggestions_action)
+
+            sep_1 = QAction(menu)
+            sep_1.setSeparator(True)
+            prepend_actions.append(sep_1)
+
+            add_action = QAction(f'Add "{misspelled_word}" to Dictionary', menu)
+            add_action.triggered.connect(lambda checked=False, w=misspelled_word: self._add_word_to_dictionary(w))
+            prepend_actions.append(add_action)
+
+            sep_2 = QAction(menu)
+            sep_2.setSeparator(True)
+            prepend_actions.append(sep_2)
+
+            existing_actions = menu.actions()
+            menu.insertActions(existing_actions[0] if existing_actions else None, prepend_actions)
         
         if fmt.isAnchor():
             href = fmt.anchorHref()
@@ -1095,11 +1556,39 @@ class Editor(QTextEdit):
     def apply_table_style(self, table):
         rows = table.rows()
         cols = table.columns()
+
+        # Qt only applies the column width constraints that were set when
+        # the table was first inserted; adding/removing a row or column
+        # afterward (Table Editor, undo/redo, ...) does NOT extend or
+        # shrink that list to match the new column count. Any column left
+        # without an explicit constraint then collapses to near-zero, and
+        # anything typed into it wraps one letter per line, ballooning the
+        # row height. Re-apply a constraint to every column the table
+        # actually has right now, every time this runs, so the table can
+        # never end up in that state. VariableLength (rather than a fixed
+        # percentage share) tells Qt's layout to size each column to fit
+        # its own content, re-measured on every layout pass - so columns
+        # naturally widen/narrow with the text typed into them instead of
+        # being locked to an equal split of the table width.
+        table_fmt = table.format()
+        table_fmt.setColumnWidthConstraints(
+            [QTextLength(QTextLength.VariableLength, 0)] * cols
+        )
+        table.setFormat(table_fmt)
+
         header_bg = QColor(self.settings["table_header_bg"])
         header_text = QColor(self.settings["table_header_text"])
         row1_bg = QColor(self.settings["table_row1_bg"])
         row2_bg = QColor(self.settings["table_row2_bg"])
-        
+
+        align_map = {
+            "left": Qt.AlignLeft,
+            "center": Qt.AlignHCenter,
+            "right": Qt.AlignRight,
+        }
+        header_align = align_map.get(self.settings.get("table_header_align", "left"), Qt.AlignLeft)
+        row_align = align_map.get(self.settings.get("table_row_align", "left"), Qt.AlignLeft)
+
         for r in range(rows):
             for c in range(cols):
                 cell = table.cellAt(r, c)
@@ -1114,11 +1603,32 @@ class Editor(QTextEdit):
                     fmt.setFontWeight(QFont.Normal)
                 cell.setFormat(fmt)
 
+                # Alignment lives on the paragraph(s) inside the cell, not
+                # on the cell's char format, so it has to be applied via a
+                # cursor over each block the cell contains (usually one,
+                # but a cell can hold several paragraphs).
+                align = header_align if r == 0 else row_align
+                it = cell.begin()
+                while not it.atEnd():
+                    blk = it.currentBlock()
+                    if blk.isValid():
+                        blk_cursor = QTextCursor(blk)
+                        blk_fmt = blk_cursor.blockFormat()
+                        if blk_fmt.alignment() != align:
+                            blk_fmt.setAlignment(align)
+                            blk_cursor.setBlockFormat(blk_fmt)
+                    it += 1
+
 
 class EditorTabs(QTabWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setTabsClosable(True)
+        # Qt's built-in close-button subcontrol is disabled (see the
+        # "image: none" rule in apply_app_theme) because styling its
+        # default glyph reliably via QSS across platforms/styles isn't
+        # possible - so tab-closing is handled with our own themed
+        # QToolButton per tab (see add_close_button) instead.
+        self.setTabsClosable(False)
         self.setMovable(True)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
@@ -1128,6 +1638,38 @@ class EditorTabs(QTabWidget):
         self.plus_btn.setToolTip("New Tab")
         self.plus_btn.setAutoRaise(True)
         self.setCornerWidget(self.plus_btn, Qt.TopRightCorner)
+
+    def add_close_button(self, editor):
+        """Create and attach a themed SVG 'x' close button for the tab
+        hosting `editor`. Looked up by widget identity (via indexOf) at
+        click time, rather than a captured index, so it keeps closing the
+        right tab even after other tabs are reordered/closed."""
+        btn = QToolButton(self)
+        btn.setAutoRaise(True)
+        btn.setToolTip("Close Tab")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedSize(18, 18)
+        btn.setIconSize(QSize(12, 12))
+        btn.setStyleSheet(
+            "QToolButton { background: transparent; border: none; border-radius: 2px; }"
+            "QToolButton:hover { background: #ff4d4d; }"
+        )
+        btn.clicked.connect(lambda checked=False, ed=editor: self.window().close_tab(self.indexOf(ed)))
+        self.update_close_button_icon(btn)
+        self.tabBar().setTabButton(self.indexOf(editor), QTabBar.RightSide, btn)
+        return btn
+
+    def update_close_button_icon(self, btn):
+        window = self.window()
+        color = window.settings.get("app_text", "#d4d4d4") if window else "#d4d4d4"
+        btn.setIcon(make_svg_icon("close", color, size=14))
+
+    def refresh_close_button_icons(self):
+        """Re-tint every tab's close icon - call after the theme changes."""
+        for i in range(self.count()):
+            btn = self.tabBar().tabButton(i, QTabBar.RightSide)
+            if btn is not None:
+                self.update_close_button_icon(btn)
 
     def show_context_menu(self, pos):
         index = self.tabBar().tabAt(self.tabBar().mapFrom(self, pos))
@@ -1178,6 +1720,7 @@ class SettingsDialog(QDialog):
         self.add_color_picker(layout, "App Background", "app_bg")
         self.add_color_picker(layout, "Editor Background", "editor_bg")
         self.add_color_picker(layout, "Normal Text", "editor_text")
+        self.add_color_picker(layout, "Current Line Highlight", "current_line_highlight")
 
         font_btn = QPushButton("Select font and size (global)")
         font_btn.clicked.connect(self.choose_font)
@@ -1228,6 +1771,10 @@ class SettingsDialog(QDialog):
         self.add_color_picker(layout, "Row 1 (background)", "table_row1_bg")
         self.add_color_picker(layout, "Row 2 (background)", "table_row2_bg")
 
+        self.align_combos = {}
+        self.add_alignment_setting(layout, "First row text alignment", "table_header_align")
+        self.add_alignment_setting(layout, "Other rows text alignment", "table_row_align")
+
         layout.addRow(QLabel("--- Tab Colors ---"))
         self.add_color_picker(layout, "Active tab (background)", "tab_active_bg")
         self.add_color_picker(layout, "Inactive tab (background)", "tab_inactive_bg")
@@ -1273,6 +1820,17 @@ class SettingsDialog(QDialog):
             
         layout.addRow(label_text, row_widget)
 
+    def add_alignment_setting(self, layout, label_text, align_key):
+        combo = QComboBox()
+        combo.addItem("Left", "left")
+        combo.addItem("Center", "center")
+        combo.addItem("Right", "right")
+        current = self.settings.get(align_key, "left")
+        idx = combo.findData(current)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        layout.addRow(label_text, combo)
+        self.align_combos[align_key] = combo
+
     def pick_color(self, key, btn):
         color = QColorDialog.getColor(QColor(self.settings[key]))
         if color.isValid():
@@ -1293,6 +1851,8 @@ class SettingsDialog(QDialog):
         self.settings["link_underline"] = self.underline_check.isChecked()
         self.settings["quote_line_width"] = self.quote_line_width_spin.value()
         self.settings["hr_thickness"] = self.hr_thickness_spin.value()
+        for key, combo in self.align_combos.items():
+            self.settings[key] = combo.currentData()
         super().accept()
 
     def get_settings(self):
@@ -1304,9 +1864,16 @@ class PreferencesDialog(QDialog):
         super().__init__(parent)
         self.settings = settings.copy()
         self.setWindowTitle("Preferences - MPad++")
-        self.setMinimumWidth(350)
+        self.setMinimumWidth(400)
 
-        layout = QFormLayout(self)
+        outer_layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        outer_layout.addWidget(self.tabs)
+
+        # --- General tab ---
+        general_tab = QWidget()
+        layout = QFormLayout(general_tab)
 
         line_break_widget = QWidget()
         line_break_layout = QVBoxLayout(line_break_widget)
@@ -1317,8 +1884,8 @@ class PreferencesDialog(QDialog):
 
         line_break_options = [
             ("br", "<br>"),
-            ("double_space", "[podwójna spacja]"),
-            ("backslash", "\\ i enter"),
+            ("double_space", "[double space]"),
+            ("backslash", "\\ and enter"),
         ]
         current_line_break = self.settings.get("line_break_style", "double_space")
         for value, label_text in line_break_options:
@@ -1329,18 +1896,122 @@ class PreferencesDialog(QDialog):
             self.line_break_radios[value] = radio
             line_break_layout.addWidget(radio)
 
-        layout.addRow("Nowa linia (znak):", line_break_widget)
+        layout.addRow("New line (character):", line_break_widget)
+
+        self.tabs.addTab(general_tab, "General")
+
+        # --- Spell Check tab ---
+        spell_tab = QWidget()
+        spell_layout = QFormLayout(spell_tab)
+
+        # --- Spell check languages (multi-select via checkboxes) ---
+        lang_widget = QWidget()
+        lang_layout = QVBoxLayout(lang_widget)
+        lang_layout.setContentsMargins(0, 0, 0, 0)
+        lang_scroll = QScrollArea()
+        lang_scroll.setWidgetResizable(True)
+        lang_scroll.setFixedHeight(150)
+        lang_inner = QWidget()
+        lang_inner_layout = QVBoxLayout(lang_inner)
+        lang_inner_layout.setContentsMargins(4, 4, 4, 4)
+        lang_scroll.setWidget(lang_inner)
+        lang_layout.addWidget(lang_scroll)
+
+        self.spell_lang_checks = {}
+        active_langs = set(self.settings.get("spellcheck_langs", ["pl_PL"]))
+        for lang_name, lang_code in SPELLCHECK_LANGUAGES:
+            check = QCheckBox(lang_name)
+            check.setChecked(lang_code in active_langs)
+            self.spell_lang_checks[lang_code] = check
+            lang_inner_layout.addWidget(check)
+        lang_inner_layout.addStretch()
+
+        if phunspell is None:
+            lang_widget.setEnabled(False)
+            lang_widget.setToolTip("Requires the 'phunspell' package: pip install phunspell")
+
+        spell_layout.addRow("Spell check languages:", lang_widget)
+
+        # --- Personal dictionary (custom words added via the editor's
+        # right-click "Add to Dictionary") ---
+        dict_widget = QWidget()
+        dict_layout = QVBoxLayout(dict_widget)
+        dict_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.custom_word_search = QLineEdit()
+        self.custom_word_search.setPlaceholderText("Search words...")
+        self.custom_word_search.textChanged.connect(self._filter_custom_words)
+        dict_layout.addWidget(self.custom_word_search)
+
+        self.custom_words_list = QListWidget()
+        self.custom_words_list.setFixedHeight(120)
+        self.custom_words_list.setSelectionMode(QListWidget.ExtendedSelection)
+        for word in sorted(self.settings.get("spellcheck_custom_words", [])):
+            self.custom_words_list.addItem(QListWidgetItem(word))
+        dict_layout.addWidget(self.custom_words_list)
+
+        dict_add_row = QHBoxLayout()
+        self.custom_word_input = QLineEdit()
+        self.custom_word_input.setPlaceholderText("New word...")
+        add_word_btn = QPushButton("Add")
+        add_word_btn.clicked.connect(self._add_custom_word)
+        self.custom_word_input.returnPressed.connect(self._add_custom_word)
+        dict_add_row.addWidget(self.custom_word_input)
+        dict_add_row.addWidget(add_word_btn)
+        dict_layout.addLayout(dict_add_row)
+
+        remove_word_btn = QPushButton("Remove selected")
+        remove_word_btn.clicked.connect(self._remove_selected_custom_words)
+        dict_layout.addWidget(remove_word_btn)
+
+        if phunspell is None:
+            dict_widget.setEnabled(False)
+
+        spell_layout.addRow("Personal dictionary:", dict_widget)
+
+        self.tabs.addTab(spell_tab, "Spell Check")
 
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
-        layout.addRow(btn_box)
+        outer_layout.addWidget(btn_box)
+
+    def _add_custom_word(self):
+        word = self.custom_word_input.text().strip()
+        if not word:
+            return
+        existing = [self.custom_words_list.item(i).text().lower()
+                    for i in range(self.custom_words_list.count())]
+        if word.lower() not in existing:
+            self.custom_words_list.addItem(QListWidgetItem(word))
+        self.custom_word_input.clear()
+
+    def _remove_selected_custom_words(self):
+        for item in self.custom_words_list.selectedItems():
+            self.custom_words_list.takeItem(self.custom_words_list.row(item))
+
+    def _filter_custom_words(self, text):
+        """Hides list rows that don't contain the search text (case-insensitive),
+        without touching the underlying items, so removal/adding still works
+        normally on the full (unfiltered) set."""
+        query = text.strip().lower()
+        for i in range(self.custom_words_list.count()):
+            item = self.custom_words_list.item(i)
+            item.setHidden(bool(query) and query not in item.text().lower())
 
     def accept(self):
         for value, radio in self.line_break_radios.items():
             if radio.isChecked():
                 self.settings["line_break_style"] = value
                 break
+
+        selected_langs = [code for code, check in self.spell_lang_checks.items() if check.isChecked()]
+        if selected_langs:
+            self.settings["spellcheck_langs"] = selected_langs
+
+        self.settings["spellcheck_custom_words"] = sorted(
+            self.custom_words_list.item(i).text().lower() for i in range(self.custom_words_list.count())
+        )
         super().accept()
 
     def get_settings(self):
@@ -1596,7 +2267,12 @@ class MainWindow(QMainWindow):
 
         self.settings_file = "mpad_settings.json"
         self.settings = self.load_settings()
-        
+
+        self.spell_manager = SpellCheckManager(self.settings, self)
+        if self.spell_manager.enabled:
+            for lang_code in self.spell_manager.lang_codes:
+                self.spell_manager._ensure_loaded(lang_code)
+
         self.apply_app_theme()
 
         self.tab_widget = EditorTabs(self)
@@ -1639,13 +2315,11 @@ class MainWindow(QMainWindow):
     def apply_app_theme(self):
         self.setStyleSheet(f"""
             QMainWindow {{ background-color: {self.settings['app_bg']}; }}
-            #TopGapContainer {{ background-color: #2d2d2d; }}
+            #TopGapContainer {{ background-color: {self.settings['app_bg']}; }}
             QTabWidget::pane {{ border: none; background: {self.settings['editor_bg']}; }}
             QTabBar::tab {{ background: {self.settings['tab_inactive_bg']}; color: #888; padding: 5px 12px 8px 12px; border: 1px solid #1e1e1e; border-top: 3px solid transparent; }}
             QTabBar::tab:selected {{ background: {self.settings['tab_active_bg']}; color: {self.settings['app_text']}; border-bottom: none; border-top: 3px solid {self.settings['tab_active_bar_color']}; }}
             QTabBar::tab:hover:!selected {{ background: #383838; }}
-            QTabBar::close-button {{ image: none; subcontrol-position: right; margin: 2px; border-radius: 2px; }}
-            QTabBar::close-button:hover {{ background: #ff4d4d; }}
             QToolBar {{ background-color: #2d2d2d; border: none; spacing: 2px; }}
             QToolButton {{ background-color: #3e3e42; color: {self.settings['app_text']}; border: 1px solid #555; padding: 5px; border-radius: 3px; }}
             QToolButton:hover {{ background-color: #505050; }}
@@ -1688,6 +2362,24 @@ class MainWindow(QMainWindow):
         file_menu.addAction(save_as_action)
         
         edit_menu = menubar.addMenu("Edit")
+
+        cut_action = QAction("Cut", self)
+        cut_action.setShortcut(QKeySequence.Cut)
+        cut_action.triggered.connect(self.edit_cut)
+        edit_menu.addAction(cut_action)
+
+        copy_action = QAction("Copy", self)
+        copy_action.setShortcut(QKeySequence.Copy)
+        copy_action.triggered.connect(self.edit_copy)
+        edit_menu.addAction(copy_action)
+
+        paste_action = QAction("Paste", self)
+        paste_action.setShortcut(QKeySequence.Paste)
+        paste_action.triggered.connect(self.edit_paste)
+        edit_menu.addAction(paste_action)
+
+        edit_menu.addSeparator()
+
         find_replace_action = QAction("Find && Replace", self)
         find_replace_action.setShortcut(QKeySequence("Ctrl+F"))
         find_replace_action.triggered.connect(self.open_find_replace)
@@ -1718,6 +2410,19 @@ class MainWindow(QMainWindow):
         prefs_action = QAction("Preferences", self)
         prefs_action.triggered.connect(self.open_preferences)
         settings_menu.addAction(prefs_action)
+
+        settings_menu.addSeparator()
+
+        self.act_spellcheck_menu = QAction("Spell Check", self)
+        self.act_spellcheck_menu.setCheckable(True)
+        self.act_spellcheck_menu.setChecked(self.settings.get("spellcheck_enabled", False))
+        self.act_spellcheck_menu.triggered.connect(self.toggle_spellcheck)
+        settings_menu.addAction(self.act_spellcheck_menu)
+
+        if not self.spell_manager.available:
+            self.act_spellcheck_menu.setEnabled(False)
+            self.act_spellcheck_menu.setToolTip(
+                "Spell checking requires the 'phunspell' package.\nInstall it with: pip install phunspell")
 
     def create_toolbar(self):
         toolbar = QToolBar("Formatting")
@@ -1793,6 +2498,18 @@ class MainWindow(QMainWindow):
         self.act_link.triggered.connect(self.insert_link)
         toolbar.addAction(self.act_link)
 
+        toolbar.addSeparator()
+
+        self.act_spellcheck_toolbar = QAction("", self); self.act_spellcheck_toolbar.setCheckable(True)
+        self.act_spellcheck_toolbar.setToolTip("Spell Check")
+        self.act_spellcheck_toolbar.setChecked(self.settings.get("spellcheck_enabled", False))
+        self.act_spellcheck_toolbar.triggered.connect(self.toggle_spellcheck)
+        if not self.spell_manager.available:
+            self.act_spellcheck_toolbar.setEnabled(False)
+            self.act_spellcheck_toolbar.setToolTip(
+                "Spell checking requires the 'phunspell' package.\nInstall it with: pip install phunspell")
+        toolbar.addAction(self.act_spellcheck_toolbar)
+
         # Icons are tinted to the current theme's toolbar text color, so
         # collect the actions once here and reuse this map to re-tint them
         # if the theme changes later (see refresh_toolbar_icons()).
@@ -1800,6 +2517,7 @@ class MainWindow(QMainWindow):
             "bold": self.act_bold, "italic": self.act_italic, "underline": self.act_underline,
             "code": self.act_code, "quote": self.act_quote, "ul": self.act_ul, "ol": self.act_ol,
             "table": self.act_table, "line": self.act_hr, "link": self.act_link,
+            "spellcheck": self.act_spellcheck_toolbar,
         }
         self.refresh_toolbar_icons()
 
@@ -1830,6 +2548,7 @@ class MainWindow(QMainWindow):
         color = self.settings.get("app_text", "#d4d4d4")
         for name, action in self._icon_actions.items():
             action.setIcon(make_svg_icon(name, color, size=20))
+        self.tab_widget.refresh_close_button_icons()
 
     def update_toolbar_margin(self):
         editor = self.tab_widget.currentWidget()
@@ -1841,10 +2560,24 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Alt+Up"), self, activated=lambda: self.move_line(-1))
         QShortcut(QKeySequence("Alt+Down"), self, activated=lambda: self.move_line(1))
 
+    # --- Spell Checking ---
+    def toggle_spellcheck(self, checked):
+        self.spell_manager.set_enabled(checked)
+        self.save_settings()
+        # The menu checkbox and the toolbar "Aa" button both control the
+        # same setting - keep them in sync no matter which one was clicked,
+        # without re-triggering each other.
+        for action in (getattr(self, "act_spellcheck_menu", None), getattr(self, "act_spellcheck_toolbar", None)):
+            if action is not None and action.isChecked() != checked:
+                action.blockSignals(True)
+                action.setChecked(checked)
+                action.blockSignals(False)
+
     # --- Tab Management ---
     def new_tab(self, switch=True):
         editor = Editor(self.settings, self)
         index = self.tab_widget.addTab(editor, "New")
+        self.tab_widget.add_close_button(editor)
         editor.selectionChanged.connect(self.update_toolbar_state)
         editor.document().modificationChanged.connect(lambda mod, e=editor: self.on_modification_changed(e))
         if switch:
@@ -2483,11 +3216,27 @@ class MainWindow(QMainWindow):
                     event.ignore()
                     return
                 break
+        self.spell_manager.shutdown()
         event.accept()
 
     # --- WYSIWYG Formatting ---
     def get_editor(self):
         return self.tab_widget.currentWidget()
+
+    def edit_cut(self):
+        editor = self.get_editor()
+        if editor:
+            editor.cut()
+
+    def edit_copy(self):
+        editor = self.get_editor()
+        if editor:
+            editor.copy()
+
+    def edit_paste(self):
+        editor = self.get_editor()
+        if editor:
+            editor.paste()
 
     def toggle_bold(self):
         editor = self.get_editor()
@@ -2797,7 +3546,22 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             rows, cols = dialog.get_data()
             cursor = editor.textCursor()
-            cursor.insertTable(rows, cols)
+            # A bare insertTable(rows, cols) leaves every column's width
+            # unconstrained, so Qt shrinks empty columns down to ~0px - the
+            # table renders as a sliver of stacked cell backgrounds/borders
+            # instead of a real grid. Explicitly stretch columns to share
+            # the available width equally, and give cells padding/borders
+            # so they're visible even before any text is typed into them.
+            fmt = QTextTableFormat()
+            fmt.setCellPadding(6)
+            fmt.setCellSpacing(0)
+            fmt.setBorder(1)
+            fmt.setBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+            fmt.setBorderBrush(QColor("#555555"))
+            fmt.setColumnWidthConstraints(
+                [QTextLength(QTextLength.VariableLength, 0)] * cols
+            )
+            cursor.insertTable(rows, cols, fmt)
             editor.style_tables()
 
     def open_table_editor(self):
@@ -2816,22 +3580,24 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
         
         btn_add_row = QPushButton("Add row below cursor")
-        btn_add_row.clicked.connect(lambda: table.insertRows(row + 1, 1))
+        btn_add_row.clicked.connect(lambda: (table.insertRows(row + 1, 1), editor.style_tables()))
         layout.addWidget(btn_add_row)
         
         btn_del_row = QPushButton("Delete cursor row")
         def del_row():
             if table.rows() > 1: table.removeRows(row, 1)
+            editor.style_tables()
         btn_del_row.clicked.connect(del_row)
         layout.addWidget(btn_del_row)
         
         btn_add_col = QPushButton("Add column to the right")
-        btn_add_col.clicked.connect(lambda: table.insertColumns(col + 1, 1))
+        btn_add_col.clicked.connect(lambda: (table.insertColumns(col + 1, 1), editor.style_tables()))
         layout.addWidget(btn_add_col)
         
         btn_del_col = QPushButton("Delete cursor column")
         def del_col():
             if table.columns() > 1: table.removeColumns(col, 1)
+            editor.style_tables()
         btn_del_col.clicked.connect(del_col)
         layout.addWidget(btn_del_col)
         
@@ -3242,6 +4008,11 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             self.settings.update(dialog.get_settings())
             self.save_settings()
+            # Preferences edited spell-check languages and/or the personal
+            # dictionary directly in self.settings - sync SpellCheckManager's
+            # in-memory state (and reload/rehighlight) to match.
+            self.spell_manager.set_custom_words(self.settings.get("spellcheck_custom_words", []))
+            self.spell_manager.set_languages(self.settings.get("spellcheck_langs", ["pl_PL"]))
 
 
 if __name__ == "__main__":
