@@ -309,6 +309,9 @@ class SpellCheckManager(QObject):
         self._threads = []
         self._suggestion_cache = {}    # (lang_codes, word_lower) -> list[str]
         self._suggestion_threads = []
+        self._suggestion_inflight = set()   # cache keys currently running or queued
+        self._suggestion_queue = []         # (key, word, limit) waiting for a free thread slot
+        self._max_concurrent_suggestion_threads = 2
         self.custom_words = set(w.lower() for w in settings.get("spellcheck_custom_words", []))
 
     @property
@@ -430,28 +433,72 @@ class SpellCheckManager(QObject):
         or None if they haven't been fetched yet. Never blocks."""
         return self._suggestion_cache.get(self._suggestion_cache_key(word))
 
-    def request_suggestions(self, word, limit=6):
+    def request_suggestions(self, word, limit=6, prefetch=False):
         """Non-blocking counterpart to suggestions(): returns cached
         suggestions immediately if available, otherwise kicks off a
-        background computation and returns None. `suggestions_ready`
-        fires with the same word once that background thread finishes,
-        so callers (the right-click menu) can open instantly with a
-        placeholder instead of freezing while phunspell searches its
-        dictionary, then fill in the real list a moment later."""
+        background computation (or queues it, see below) and returns
+        None. `suggestions_ready` fires with the same word once the
+        background thread finishes, so callers (the right-click menu)
+        can open instantly with a placeholder instead of freezing while
+        phunspell searches its dictionary, then fill in the real list a
+        moment later.
+
+        Only `_max_concurrent_suggestion_threads` suggestion searches run
+        at once - phunspell's edit-distance search is CPU-heavy, so
+        firing off unlimited threads (e.g. when the highlighter prefetches
+        suggestions for every misspelled word on screen) would just make
+        every one of them slower. Anything beyond that limit is queued;
+        `prefetch=True` (used by the highlighter, see below) puts the
+        request at the back of the queue, while an explicit ask - e.g. the
+        right-click menu - jumps to the front so it isn't stuck waiting
+        behind background work.
+
+        Duplicate requests for the same (languages, word) are collapsed:
+        if it's already running or queued, this just returns None again
+        without spawning another thread; the eventual `suggestions_ready`
+        covers every caller."""
         key = self._suggestion_cache_key(word)
         cached = self._suggestion_cache.get(key)
         if cached is not None:
             return cached
+        if key in self._suggestion_inflight:
+            return None  # already running or queued - suggestions_ready will fire once
+        self._suggestion_inflight.add(key)
         self._suggestion_threads = [t for t in self._suggestion_threads if t.isRunning()]
+        if len(self._suggestion_threads) >= self._max_concurrent_suggestion_threads:
+            entry = (key, word, limit)
+            if prefetch:
+                self._suggestion_queue.append(entry)
+            else:
+                self._suggestion_queue.insert(0, entry)
+            return None
+        self._start_suggestion_thread(key, word, limit)
+        return None
+
+    def _start_suggestion_thread(self, key, word, limit):
         thread = _SuggestionLoaderThread(word, self.current_dictionaries(), limit, self)
         thread.ready.connect(lambda w, results, k=key: self._on_suggestions_ready(k, results))
         self._suggestion_threads.append(thread)
         thread.start()
-        return None
+
+    def prefetch_suggestions(self, word, limit=6):
+        """Warms the suggestion cache for `word` in the background without
+        anyone waiting on it. Called by the highlighter as soon as a word
+        is flagged misspelled, so that by the time the user actually
+        right-clicks it, suggestions are often already sitting in the
+        cache and the context menu can show them immediately instead of
+        displaying "Loading suggestions..." while phunspell searches."""
+        self.request_suggestions(word, limit, prefetch=True)
 
     def _on_suggestions_ready(self, key, results):
         self._suggestion_cache[key] = results
+        self._suggestion_inflight.discard(key)
         self.suggestions_ready.emit(key[1], results)
+        # A thread slot just freed up - start the next queued request, if any.
+        self._suggestion_threads = [t for t in self._suggestion_threads if t.isRunning()]
+        if self._suggestion_queue and len(self._suggestion_threads) < self._max_concurrent_suggestion_threads:
+            next_key, next_word, next_limit = self._suggestion_queue.pop(0)
+            self._start_suggestion_thread(next_key, next_word, next_limit)
 
     def shutdown(self):
         """Stop cleanly on app exit so no background QThread outlives
@@ -505,6 +552,10 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
 
             if not manager.is_correct(word):
                 self.setFormat(match.start(), len(word), self._format)
+                # Warm the suggestion cache now, while the word is being
+                # underlined, instead of waiting for a right-click - see
+                # SpellCheckManager.prefetch_suggestions().
+                manager.prefetch_suggestions(word)
 
 
 class Editor(QTextEdit):
