@@ -874,7 +874,29 @@ class Editor(QTextEdit):
                 if last_top > viewport_height:
                     break
 
-                block = self.document().findBlock(table.lastPosition() + 1)
+                next_block = self.document().findBlock(table.lastPosition() + 1)
+                # Qt requires a real paragraph immediately after a table
+                # (nowhere else to put the cursor to type below it) - if
+                # it's still empty, it's purely that structural placeholder,
+                # not a line the person actually wrote. Skip its own gutter
+                # number so "N rows" reads as exactly N numbers instead of
+                # N+1; the moment they type something into it, it's a real
+                # line again and gets numbered normally.
+                if next_block.isValid() and next_block.text() == "":
+                    block = next_block.next()
+                else:
+                    block = next_block
+                continue
+
+            # Mirror image of the above: an empty paragraph sitting right
+            # before a table is that same Qt-mandated placeholder (this
+            # time for typing *above* the table) rather than a line someone
+            # deliberately left blank - skip it too so the table's first
+            # row gets the very next number.
+            next_block = block.next()
+            if (block.text() == "" and next_block.isValid()
+                    and QTextCursor(next_block).currentTable() is not None):
+                block = next_block
                 continue
 
             rect = self.document().documentLayout().blockBoundingRect(block)
@@ -1590,6 +1612,19 @@ class Editor(QTextEdit):
         rows = table.rows()
         cols = table.columns()
 
+        table_fmt = table.format()
+        # Qt requires a real (editable) paragraph immediately before and
+        # after every table - there's nowhere else to put the cursor to
+        # type outside it. With zero margin that paragraph sits pixel-tight
+        # against the table's first/last row, so on screen (and in the line
+        # number gutter) it reads as if that row got an extra number
+        # instead of "table row + separate blank line right above/below
+        # it". A small top/bottom margin on the table's own frame just
+        # gives that line breathing room so it visually reads as its own
+        # line, without changing what's actually in the document.
+        table_fmt.setTopMargin(8)
+        table_fmt.setBottomMargin(8)
+
         # Qt only applies the column width constraints that were set when
         # the table was first inserted; adding/removing a row or column
         # afterward (Table Editor, undo/redo, ...) does NOT extend or
@@ -1603,7 +1638,6 @@ class Editor(QTextEdit):
         # its own content, re-measured on every layout pass - so columns
         # naturally widen/narrow with the text typed into them instead of
         # being locked to an equal split of the table width.
-        table_fmt = table.format()
         table_fmt.setColumnWidthConstraints(
             [QTextLength(QTextLength.VariableLength, 0)] * cols
         )
