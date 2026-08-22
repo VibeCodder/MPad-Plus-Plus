@@ -724,22 +724,27 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
     def _on_cursor_moved(self):
         # This fires on EVERY cursor-position change - including the one
         # caused by simply typing the next letter of the same word, since
-        # inserting a character moves the cursor too. Forcing an immediate
-        # recheck on every such move would defeat the whole point of
-        # skipping the active word above (it'd still get checked once per
-        # keystroke). Only force an immediate check when the cursor has
-        # genuinely LEFT the word - i.e. the character right before the new
-        # position isn't itself a word character anymore (space, newline,
-        # punctuation) or we've moved to a different block entirely; plain
-        # navigation/typing that keeps the cursor touching the same word is
-        # left for the idle debounce timer to catch instead.
+        # inserting a character moves the cursor too. It also fires once
+        # per character on punctuation-dense text (many short word
+        # fragments separated by commas/semicolons/etc., as reported) -
+        # each fragment boundary counts as "leaving a word". Firing an
+        # IMMEDIATE, synchronous rehighlightBlock() (a full re-scan of the
+        # whole line) on every one of those crossings is what produced
+        # visible lag specifically on that kind of text, even though plain
+        # prose - far fewer, sparser boundaries - felt fine.
+        #
+        # Only ever restarting the SAME short idle timer here - never
+        # firing immediately - means a rapid burst of boundary crossings
+        # (typing "a,b,c,d,e,f,") collapses into exactly one
+        # rehighlightBlock() call once things go quiet, instead of one per
+        # comma. The cost is underlines appearing up to ~300ms after
+        # finishing a word instead of instantly, which isn't perceptible.
         if self._pending_recheck_block is None:
             return
         cursor = self.editor.textCursor()
         block = cursor.block()
         if block != self._pending_recheck_block:
-            self._debounce.stop()
-            self._recheck_active_word()
+            self._debounce.start()
             return
         if self._pending_recheck_whole_block:
             # Deferred because the whole paragraph is large, not because of
@@ -755,8 +760,7 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
         still_touching_word = local_pos > 0 and SPELLCHECK_WORD_CHAR_RE.match(text[local_pos - 1])
         if still_touching_word:
             return
-        self._debounce.stop()
-        self._recheck_active_word()
+        self._debounce.start()
 
     def _recheck_active_word(self):
         block = self._pending_recheck_block
