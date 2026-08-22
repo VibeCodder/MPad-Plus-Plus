@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout
                                QRadioButton, QButtonGroup, QListWidget, QListWidgetItem,
                                QComboBox)
 from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListFormat,
-                           QKeySequence, QShortcut, QFont, QPalette,
+                           QKeySequence, QShortcut, QFont, QFontMetrics, QPalette,
                            QAction, QActionGroup, QTextCursor, QDragEnterEvent, QDropEvent, 
                            QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon, QPixmap,
                            QSyntaxHighlighter, QTextTableFormat, QTextLength, QTextFrameFormat)
@@ -60,6 +60,16 @@ SPELLCHECK_LANGUAGES = [
 # contractions and hyphenated words ("don't", "wielko-formatowy")
 # aren't split into bogus fragments.
 SPELLCHECK_WORD_RE = re.compile(r"[^\W\d_]+(?:['\u2019-][^\W\d_]+)*", re.UNICODE)
+# Matches a single "word" character - used to tell whether the cursor is
+# still sitting inside/next to a word (still typing it) versus having
+# genuinely left it (space, punctuation, newline, click elsewhere).
+SPELLCHECK_WORD_CHAR_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+# Above this many characters in a single block/paragraph, re-scanning
+# every word in it (regex matching + per-word QTextCursor probing + cache
+# lookups) on every single keystroke becomes measurable, scaling work on
+# the GUI thread even though each individual check is cheap in isolation -
+# see SpellCheckHighlighter.highlightBlock().
+SPELLCHECK_LARGE_BLOCK_CHARS = 200
 
 
 # --- Default settings ---
@@ -283,6 +293,39 @@ class _SuggestionLoaderThread(QThread):
         self.ready.emit(self.word, results)
 
 
+class _CorrectnessCheckThread(QThread):
+    """Looks up a batch of words in the loaded dictionaries off the GUI
+    thread. phunspell.lookup() does real affix/morphology analysis (not
+    just a hash check), and SpellCheckHighlighter.highlightBlock() -
+    which calls it - is invoked by Qt synchronously, on the GUI thread,
+    after every single keystroke. Running the lookups here instead means
+    highlightBlock() itself never blocks on dictionary work: it only
+    reads/writes a plain dict cache and hands off anything not yet known
+    to this thread, so typing stays responsive regardless of how heavy
+    the underlying dictionary check is or how long the paragraph is."""
+    ready = Signal(dict)  # word_lower -> bool
+
+    def __init__(self, words, dictionaries, parent=None):
+        super().__init__(parent)
+        self.words = words
+        self.dictionaries = dictionaries
+
+    def run(self):
+        results = {}
+        for word in self.words:
+            correct = False
+            for dictionary in self.dictionaries:
+                try:
+                    if dictionary.lookup(word):
+                        correct = True
+                        break
+                except Exception:
+                    correct = True
+                    break
+            results[word.lower()] = correct
+        self.ready.emit(results)
+
+
 class SpellCheckManager(QObject):
     """Owns the spell-check state (on/off, active languages, loaded
     dictionaries, personal dictionary) shared by every open Editor tab, so
@@ -313,6 +356,25 @@ class SpellCheckManager(QObject):
         self._suggestion_queue = []         # (key, word, limit) waiting for a free thread slot
         self._max_concurrent_suggestion_threads = 2
         self.custom_words = set(w.lower() for w in settings.get("spellcheck_custom_words", []))
+        # (lang_codes, word_lower) -> bool. QSyntaxHighlighter re-runs
+        # highlightBlock() for the WHOLE current block/paragraph on every
+        # single edit, not just for the word that actually changed - so
+        # without caching, every other, unchanged word already in that
+        # paragraph gets re-looked-up in the dictionary on every keystroke
+        # too (phunspell's lookup does real affix/morphology analysis, not
+        # just a hash check, so this was the main source of the typing lag
+        # reported with spell check on for longer lines). A word's
+        # correctness never changes on its own, so caching it here makes
+        # every repeat check an instant dict lookup regardless of how often
+        # the surrounding paragraph gets reformatted.
+        self._correctness_cache = {}
+        self._correctness_inflight = set()   # (lang_key, word_lower) currently being checked
+        self._correctness_threads = []
+        self._correctness_queue = []   # (words, lang_key, on_done) batches waiting for a free slot
+        self._max_concurrent_correctness_threads = 1
+
+    def _invalidate_correctness_cache(self):
+        self._correctness_cache.clear()
 
     @property
     def enabled(self):
@@ -332,6 +394,7 @@ class SpellCheckManager(QObject):
         if value:
             for code in self.lang_codes:
                 self._ensure_loaded(code)
+        self._invalidate_correctness_cache()
         self.dictionary_changed.emit()
 
     def set_languages(self, lang_codes):
@@ -340,6 +403,7 @@ class SpellCheckManager(QObject):
         if self.enabled:
             for code in lang_codes:
                 self._ensure_loaded(code)
+        self._invalidate_correctness_cache()
         self.dictionary_changed.emit()
 
     def is_language_active(self, lang_code):
@@ -358,6 +422,7 @@ class SpellCheckManager(QObject):
     def _on_dictionary_loaded(self, lang_code, dictionary):
         self._dictionaries[lang_code] = dictionary
         self._loading.discard(lang_code)
+        self._invalidate_correctness_cache()
         self.dictionary_changed.emit()
 
     def current_dictionaries(self):
@@ -383,19 +448,28 @@ class SpellCheckManager(QObject):
         and manageable later via Preferences."""
         self.custom_words.add(word.lower())
         self.settings["spellcheck_custom_words"] = sorted(self.custom_words)
+        self._invalidate_correctness_cache()
         self.dictionary_changed.emit()
 
     def remove_custom_word(self, word):
         self.custom_words.discard(word.lower())
         self.settings["spellcheck_custom_words"] = sorted(self.custom_words)
+        self._invalidate_correctness_cache()
         self.dictionary_changed.emit()
 
     def set_custom_words(self, words):
         self.custom_words = set(w.lower() for w in words)
         self.settings["spellcheck_custom_words"] = sorted(self.custom_words)
+        self._invalidate_correctness_cache()
         self.dictionary_changed.emit()
 
     def is_correct(self, word):
+        """Blocking check - kept for callers that genuinely need an
+        immediate answer (right-click menu, "add to dictionary", etc.),
+        where a short synchronous dictionary lookup for a SINGLE word is
+        fine. The highlighter itself uses is_correct_cached() +
+        check_words_async() below instead, precisely to avoid ever
+        blocking the GUI thread on this while the user is typing."""
         if self.is_custom_word(word):
             return True
         dictionaries = self.current_dictionaries()
@@ -404,13 +478,106 @@ class SpellCheckManager(QObject):
             # wrong until we can actually check it (avoids a flash of
             # false positives while a dictionary loads in the background).
             return True
+        key = (tuple(sorted(self.lang_codes)), word.lower())
+        cached = self._correctness_cache.get(key)
+        if cached is not None:
+            return cached
+        result = False
         for dictionary in dictionaries:
             try:
                 if dictionary.lookup(word):
-                    return True
+                    result = True
+                    break
             except Exception:
-                return True
-        return False
+                result = True
+                break
+        self._correctness_cache[key] = result
+        return result
+
+    # Real dictionary words are essentially never this long; a token past
+    # this length is almost certainly gibberish/an identifier/a paste
+    # artifact, and phunspell's affix-stripping search over such a string
+    # is exactly the pathological case that took noticeably longer the
+    # longer the "word" got (as reported). Skipping it entirely - no
+    # lookup, no underline - avoids that cost outright instead of just
+    # moving it to a background thread.
+    MAX_CHECKED_WORD_LEN = 25
+
+    def is_correct_cached(self, word):
+        """Non-blocking: returns True/False if already known, or None if
+        this word hasn't been checked yet (and never touches the
+        dictionary itself - safe to call from highlightBlock() on every
+        keystroke). Custom words, absurdly long tokens, and the "no
+        dictionary loaded" case all resolve immediately since none of them
+        need an actual lookup."""
+        if len(word) > self.MAX_CHECKED_WORD_LEN:
+            return True
+        if self.is_custom_word(word):
+            return True
+        dictionaries = self.current_dictionaries()
+        if not dictionaries:
+            return True
+        key = (tuple(sorted(self.lang_codes)), word.lower())
+        return self._correctness_cache.get(key)
+
+    def check_words_async(self, words, on_done=None):
+        """Kicks off a background dictionary lookup for any of `words`
+        not already cached or already in flight. `on_done` fires once
+        (on the GUI thread) after this batch's results are cached, so the
+        caller (the highlighter) can re-trigger formatting for the block
+        it came from now that the answers are ready.
+
+        Only one lookup batch runs at a time (any more get queued) and
+        that thread runs at LowPriority: a background QThread still
+        shares the same Python interpreter/GIL as the GUI thread, so
+        piling up several CPU-bound lookup threads at once - or letting
+        one run at normal priority - can still starve the GUI thread of
+        the interpreter time it needs to stay responsive while typing,
+        even though the work is technically "off" the GUI thread. Keeping
+        exactly one such thread active, at low priority, bounds how much
+        of that contention can happen at once."""
+        dictionaries = self.current_dictionaries()
+        if not dictionaries:
+            return
+        lang_key = tuple(sorted(self.lang_codes))
+        to_check = []
+        seen_lower = set()
+        for w in words:
+            wl = w.lower()
+            if wl in seen_lower:
+                continue
+            seen_lower.add(wl)
+            key = (lang_key, wl)
+            if key in self._correctness_cache or key in self._correctness_inflight:
+                continue
+            self._correctness_inflight.add(key)
+            to_check.append(w)
+        if not to_check:
+            return
+        self._correctness_threads = [t for t in self._correctness_threads if t.isRunning()]
+        if len(self._correctness_threads) >= self._max_concurrent_correctness_threads:
+            self._correctness_queue.append((to_check, lang_key, on_done))
+            return
+        self._start_correctness_thread(to_check, dictionaries, lang_key, on_done)
+
+    def _start_correctness_thread(self, to_check, dictionaries, lang_key, on_done):
+        thread = _CorrectnessCheckThread(to_check, dictionaries, self)
+        thread.ready.connect(lambda results, lk=lang_key, cb=on_done: self._on_correctness_ready(results, lk, cb))
+        self._correctness_threads.append(thread)
+        thread.start(QThread.LowPriority)
+
+    def _on_correctness_ready(self, results, lang_key, on_done):
+        for word_lower, correct in results.items():
+            self._correctness_inflight.discard((lang_key, word_lower))
+            self._correctness_cache[(lang_key, word_lower)] = correct
+        if on_done:
+            on_done()
+        self._correctness_threads = [t for t in self._correctness_threads if t.isRunning()]
+        if self._correctness_queue and len(self._correctness_threads) < self._max_concurrent_correctness_threads:
+            next_words, next_lang_key, next_on_done = self._correctness_queue.pop(0)
+            dictionaries = self.current_dictionaries()
+            if dictionaries:
+                self._start_correctness_thread(next_words, dictionaries, next_lang_key, next_on_done)
 
     def suggestions(self, word, limit=6):
         results = []
@@ -508,6 +675,8 @@ class SpellCheckManager(QObject):
             thread.wait(2000)
         for thread in self._suggestion_threads:
             thread.wait(2000)
+        for thread in self._correctness_threads:
+            thread.wait(2000)
 
 
 class SpellCheckHighlighter(QSyntaxHighlighter):
@@ -525,6 +694,81 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
         self._format.setUnderlineStyle(QTextCharFormat.UnderlineStyle.WaveUnderline)
         self._format.setUnderlineColor(QColor("#ff3333"))
 
+        # --- Debounce the word currently being typed ---
+        # QSyntaxHighlighter re-runs highlightBlock() synchronously, on the
+        # GUI thread, after EVERY edit to that block - there's no supported
+        # way to move it to a worker thread, since it has to mutate the live
+        # QTextLayout formatting. For phunspell's dictionary lookup (which
+        # does real morphological/affix analysis, not just a hash lookup -
+        # especially costly for a heavily-inflected language like Polish),
+        # that means every single keystroke while typing a word re-checks
+        # that word (now one character longer/different) plus every other
+        # word already in the block, and on a fast typist that per-keystroke
+        # cost is exactly what showed up as visible input lag.
+        # Skipping the dictionary lookup specifically for the word the
+        # cursor is currently sitting inside - and checking it once, after a
+        # short idle pause or as soon as the cursor leaves it - removes
+        # nearly all of that redundant work (an in-progress word gets
+        # checked once when you're done with it, not once per letter),
+        # while every other word on screen keeps getting checked instantly
+        # as before.
+        self._skip_active_word = True
+        self._pending_recheck_block = None
+        self._pending_recheck_whole_block = False   # True = large-block deferral, not just one word
+        self._debounce = QTimer(editor)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(300)
+        self._debounce.timeout.connect(self._recheck_active_word)
+        editor.cursorPositionChanged.connect(self._on_cursor_moved)
+
+    def _on_cursor_moved(self):
+        # This fires on EVERY cursor-position change - including the one
+        # caused by simply typing the next letter of the same word, since
+        # inserting a character moves the cursor too. Forcing an immediate
+        # recheck on every such move would defeat the whole point of
+        # skipping the active word above (it'd still get checked once per
+        # keystroke). Only force an immediate check when the cursor has
+        # genuinely LEFT the word - i.e. the character right before the new
+        # position isn't itself a word character anymore (space, newline,
+        # punctuation) or we've moved to a different block entirely; plain
+        # navigation/typing that keeps the cursor touching the same word is
+        # left for the idle debounce timer to catch instead.
+        if self._pending_recheck_block is None:
+            return
+        cursor = self.editor.textCursor()
+        block = cursor.block()
+        if block != self._pending_recheck_block:
+            self._debounce.stop()
+            self._recheck_active_word()
+            return
+        if self._pending_recheck_whole_block:
+            # Deferred because the whole paragraph is large, not because of
+            # one specific word - spaces/punctuation between words inside
+            # it are still "actively editing this block", so only leaving
+            # the block entirely (handled above) or the idle timer below
+            # should trigger a recheck here; otherwise every space in a
+            # long paragraph would force a full re-scan again, right back
+            # to the original problem.
+            return
+        local_pos = cursor.position() - block.position()
+        text = block.text()
+        still_touching_word = local_pos > 0 and SPELLCHECK_WORD_CHAR_RE.match(text[local_pos - 1])
+        if still_touching_word:
+            return
+        self._debounce.stop()
+        self._recheck_active_word()
+
+    def _recheck_active_word(self):
+        block = self._pending_recheck_block
+        self._pending_recheck_block = None
+        self._pending_recheck_whole_block = False
+        if block is not None and block.isValid():
+            self._skip_active_word = False
+            try:
+                self.rehighlightBlock(block)
+            finally:
+                self._skip_active_word = True
+
     def highlightBlock(self, text):
         window = self.editor.window()
         manager = getattr(window, "spell_manager", None)
@@ -536,8 +780,34 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
         if block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True:
             return  # skip code blocks entirely
 
+        # This block is being (re)processed now, so any earlier "pending"
+        # skip recorded for it is about to be superseded below (either
+        # re-armed for whatever word the cursor is still touching, or not,
+        # if the cursor has moved on) - clear it up front so a stale
+        # leftover from a previous pass can't trigger a redundant duplicate
+        # check later via _on_cursor_moved/the debounce timer.
+        if self._pending_recheck_block == block:
+            self._pending_recheck_block = None
+            self._debounce.stop()
+
+        cursor = self.editor.textCursor()
+        cursor_in_this_block = self._skip_active_word and cursor.block().blockNumber() == block.blockNumber()
+        cursor_pos_in_block = cursor.position() - block.position() if cursor_in_this_block else -1
+
+        if cursor_in_this_block and len(text) > SPELLCHECK_LARGE_BLOCK_CHARS:
+            # This whole paragraph is being actively typed in AND is large
+            # enough that re-scanning it in full on every keystroke is
+            # itself the bottleneck (independent of any single word's
+            # length) - defer the ENTIRE block the same way a single
+            # active word is deferred below: skip it while typing, run it
+            # once idle or as soon as the cursor leaves this block.
+            self._pending_recheck_block = block
+            self._debounce.start()
+            return
+
         doc = self.document()
         probe = QTextCursor(doc)
+        pending_words = []
         for match in SPELLCHECK_WORD_RE.finditer(text):
             word = match.group()
             if len(word) < 2:
@@ -550,12 +820,34 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
             if cf.isAnchor() or (cf.hasProperty(CODE_PROP) and cf.property(CODE_PROP) == True):
                 continue
 
-            if not manager.is_correct(word):
+            if cursor_in_this_block and match.start() <= cursor_pos_in_block <= match.end():
+                self._pending_recheck_block = block
+                self._debounce.start()
+                continue
+
+            cached = manager.is_correct_cached(word)
+            if cached is None:
+                # Not known yet - don't block the GUI thread waiting for
+                # phunspell here. Collect it and hand the whole batch off
+                # to a background thread below; this word just isn't
+                # underlined (or not) until that comes back, a moment
+                # later, and triggers a cheap re-highlight of this block.
+                pending_words.append(word)
+                continue
+
+            if not cached:
                 self.setFormat(match.start(), len(word), self._format)
                 # Warm the suggestion cache now, while the word is being
                 # underlined, instead of waiting for a right-click - see
                 # SpellCheckManager.prefetch_suggestions().
                 manager.prefetch_suggestions(word)
+
+        if pending_words:
+            manager.check_words_async(pending_words, on_done=lambda b=block: self._on_words_checked(b))
+
+    def _on_words_checked(self, block):
+        if block.isValid():
+            self.rehighlightBlock(block)
 
 
 class Editor(QTextEdit):
@@ -660,6 +952,28 @@ class Editor(QTextEdit):
         self._caret_visible = True
         self.viewport().repaint()
 
+        # Even with setCursorWidth(0), QWidgetTextControl still computes and
+        # POSTS (queues) its own update for the previous cursor rect on every
+        # cursor move / text edit as part of its internal "erase old cursor,
+        # draw new one" bookkeeping. That queued update isn't delivered until
+        # the next turn of the event loop - i.e. strictly AFTER the
+        # synchronous repaint() just above - and since it can carry a
+        # narrower clip rect based on the layout as it stood before this
+        # edit/relayout, letting it paint unopposed can leave a leftover
+        # sliver of our own previously-drawn caret on screen (wrong
+        # position/height) that nothing then cleans up until the next blink.
+        # Visually this reads as a second, non-blinking caret next to the
+        # real one. Scheduling one more full-viewport repaint for the next
+        # event-loop turn - after that queued update has already been
+        # delivered - guarantees we paint over and erase it every time. A
+        # second, further-delayed repaint is chained after the first as
+        # extra insurance for slower/rarer timings where one event-loop
+        # turn isn't enough for Qt's queued update to have landed yet.
+        def _cleanup_repaint():
+            self.viewport().repaint()
+            QTimer.singleShot(0, lambda: self.viewport().repaint())
+        QTimer.singleShot(0, _cleanup_repaint)
+
     def focusInEvent(self, event):
         super().focusInEvent(event)
         # Windows re-syncs Qt's style hints (including cursorFlashTime) from
@@ -762,6 +1076,21 @@ class Editor(QTextEdit):
         self.viewport().repaint()
 
     def paintEvent(self, event):
+        # QTextDocumentLayout caches each block's bounding rect/height and
+        # only recomputes it lazily, on its own schedule (same issue
+        # documented in line_number_area_paint_event below). Right after a
+        # font/font-size change, everything this method reads below -
+        # blockBoundingRect() for the current-line highlight, cursorRect()
+        # for our custom-drawn caret, and the quote/HR block rects - could
+        # otherwise be read before that recompute has happened, producing a
+        # highlight rect and caret that still reflect the OLD font size (and,
+        # since our caret blinks on its own out-of-phase timer, an
+        # inconsistent size from one blink to the next depending on whether
+        # the layout pass had completed yet). Touching documentSize() forces
+        # any pending layout pass to finish before we read a single rect
+        # below, so every position/size here is current.
+        self.document().documentLayout().documentSize()
+
         # Draw current-line highlight as background BEFORE Qt renders text+cursor.
         # Using ExtraSelection for this caused a Windows-specific bug where Qt
         # rendered the cursor in the selection's default foreground (black),
@@ -1554,18 +1883,47 @@ class Editor(QTextEdit):
             level = block_fmt.headingLevel()
             is_quote = block_fmt.hasProperty(QUOTE_PROP) and block_fmt.property(QUOTE_PROP) == True
             is_block_code = block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True
-            
+
+            new_block_fmt = None
+
+            # NOTE: we intentionally do NOT force a fixed line height here.
+            # An earlier version of this method pinned every block's line
+            # height to a plain reference font's metrics (e.g. Arial) at the
+            # same point size, to make row spacing "consistent" regardless
+            # of which typeface was active. That backfired badly: decorative
+            # faces (e.g. "Gabriola") genuinely need more vertical room per
+            # line than their point size suggests - their real ascent/
+            # descent is simply bigger, by design - and forcing a smaller,
+            # reference-sized row height clipped the tops of their glyphs.
+            # What looked like an "inconsistent gap" for such fonts was
+            # actually correct: Qt's own default (font-metric-based) line
+            # spacing is what keeps every font's glyphs fully visible, so we
+            # leave lineHeightType/lineHeight alone and let Qt compute it
+            # per-block from each block's own real font.
+            #
+            # Documents edited under that earlier version may still carry a
+            # stale FixedHeight setting on some blocks (from before this was
+            # reverted) - clean those back to Qt's natural per-font spacing
+            # (SingleHeight, i.e. "let the font decide") so old clipped text
+            # recovers as soon as settings are re-applied.
+            if block_fmt.lineHeightType() == QTextBlockFormat.FixedHeight.value:
+                new_block_fmt = QTextBlockFormat(block_fmt)
+                new_block_fmt.setLineHeight(0.0, QTextBlockFormat.SingleHeight.value)
+
             if is_block_code:
                 current_bg = block_fmt.background().color() if block_fmt.hasProperty(QTextFormat.BackgroundBrush) else QColor(Qt.transparent)
                 if current_bg != QColor(self.settings['code_bg']):
-                    new_block_fmt = QTextBlockFormat(block_fmt)
+                    if new_block_fmt is None:
+                        new_block_fmt = QTextBlockFormat(block_fmt)
                     new_block_fmt.setBackground(QColor(self.settings['code_bg']))
-                    block_updates.append((block.position(), new_block_fmt))
             else:
                 if block_fmt.hasProperty(QTextFormat.BackgroundBrush) and block_fmt.background().color() == QColor(self.settings['code_bg']):
-                    new_block_fmt = QTextBlockFormat(block_fmt)
+                    if new_block_fmt is None:
+                        new_block_fmt = QTextBlockFormat(block_fmt)
                     new_block_fmt.setBackground(Qt.transparent)
-                    block_updates.append((block.position(), new_block_fmt))
+
+            if new_block_fmt is not None:
+                block_updates.append((block.position(), new_block_fmt))
                     
             it = block.begin()
             while not it.atEnd():
