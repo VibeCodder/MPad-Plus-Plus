@@ -2,7 +2,9 @@ import sys
 import json
 import os
 import re
+import uuid
 import webbrowser
+import urllib.request
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout, 
                                QHBoxLayout, QWidget, QToolBar, QDialog, 
                                QLabel, QLineEdit, QDialogButtonBox, QColorDialog, 
@@ -10,14 +12,15 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout
                                QMessageBox, QFileDialog, QMenu, QToolButton, QCheckBox,
                                QTabWidget, QTabBar, QSizePolicy, QScrollArea, QPlainTextEdit,
                                QRadioButton, QButtonGroup, QListWidget, QListWidgetItem,
-                               QComboBox)
+                               QComboBox, QToolTip, QInputDialog)
 from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListFormat,
                            QKeySequence, QShortcut, QFont, QFontMetrics, QPalette,
                            QAction, QActionGroup, QTextCursor, QDragEnterEvent, QDropEvent, 
                            QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon, QPixmap,
-                           QSyntaxHighlighter, QTextTableFormat, QTextLength, QTextFrameFormat)
-from PySide6.QtCore import (QRegularExpression, Qt, QFileInfo, QPoint, QSize, QRect, QRectF,
-                            QTimer, QObject, QThread, Signal)
+                           QSyntaxHighlighter, QTextTableFormat, QTextLength, QTextFrameFormat,
+                           QDesktopServices, QPyTextObject, QMovie, QImage)
+from PySide6.QtCore import (QRegularExpression, Qt, QFileInfo, QPoint, QSize, QSizeF, QRect, QRectF,
+                            QTimer, QObject, QThread, Signal, QUrl, QBuffer, QByteArray, QIODevice)
 
 try:
     from PySide6.QtSvg import QSvgRenderer
@@ -25,6 +28,19 @@ except ImportError:
     # Toolbar icons degrade gracefully to text-only buttons if the
     # optional QtSvg module isn't installed alongside PySide6.
     QSvgRenderer = None
+
+try:
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
+    HAVE_MULTIMEDIA = True
+except ImportError:
+    # Embedded audio/video playback degrades gracefully (a placeholder
+    # card with the file name is shown instead of a working player) if
+    # the optional QtMultimedia module isn't installed alongside PySide6.
+    # Install with: pip install PySide6-Addons
+    QMediaPlayer = None
+    QAudioOutput = None
+    QVideoSink = None
+    HAVE_MULTIMEDIA = False
 
 try:
     import phunspell
@@ -105,8 +121,12 @@ DEFAULT_SETTINGS = {
     "table_header_text": "#FFFFFF",
     "table_row1_bg": "#252526",
     "table_row2_bg": "#2d2d2d",
-    "table_header_align": "left",
-    "table_row_align": "left",
+    # Alignment every column of a brand-new table (Insert > Table) starts
+    # with. This only seeds the initial state - once the table exists, its
+    # alignment lives in the table itself (real Markdown ":---"/"---:"/
+    # ":---:" markers, see set_table_column_alignment()), same as if the
+    # user had picked it per-column from Edit Table right after creating it.
+    "table_default_align": "left",
     
     "tab_active_bg": "#1e1e1e",
     "tab_inactive_bg": "#2d2d2d",
@@ -121,20 +141,127 @@ DEFAULT_SETTINGS = {
     "spellcheck_enabled": False,
     "spellcheck_langs": ["pl_PL"],
     "spellcheck_custom_words": [],
+
+    # Minimum display width (px) for embedded media objects, per type.
+    # A media object is never rendered narrower than this, even if its
+    # natural (or scaled) size would otherwise be smaller - height follows
+    # proportionally, so aspect ratio is always preserved. 0 disables the
+    # minimum for that type. See Settings > Preferences > General.
+    "media_min_width_image": 0,
+    "media_min_width_gif": 0,
+    "media_min_width_video": 0,
 }
 
 CODE_PROP = QTextFormat.UserProperty + 1
 QUOTE_PROP = QTextFormat.UserProperty + 2
 BLOCK_CODE_PROP = QTextFormat.UserProperty + 3
 HR_PROP = QTextFormat.UserProperty + 4
-# Per-table text alignment OVERRIDE, set from a specific table's "Edit
-# Table" dialog (see MainWindow.open_table_editor()) and stored on that
-# QTextTableFormat. When absent, apply_table_style() falls back to the
-# app-wide default set in Preferences > General (settings keys
-# "table_header_align"/"table_row_align") - so alignment is global by
-# default, but any individual table can opt out and pick its own.
-TABLE_HEADER_ALIGN_PROP = QTextFormat.UserProperty + 5
-TABLE_ROW_ALIGN_PROP = QTextFormat.UserProperty + 6
+
+# --- Embedded media (images / gifs / video / audio) ---
+# Rendered as a single custom QTextObjectInterface object (a "media object")
+# occupying one ObjectReplacementCharacter, so it flows inline with the rest
+# of the document like any other character while being painted as a real
+# picture, animated gif, or a small audio/video player. The underlying
+# Markdown syntax is always the standard image syntax: ![alt](src).
+MEDIA_TYPE_PROP = QTextFormat.UserProperty + 10   # "image" | "gif" | "video" | "audio"
+MEDIA_SRC_PROP = QTextFormat.UserProperty + 11    # the path/URL exactly as written in the source
+MEDIA_ALT_PROP = QTextFormat.UserProperty + 12    # the "alt" display text between the [ ]
+MEDIA_ID_PROP = QTextFormat.UserProperty + 13     # unique id, used to look up the live player/movie
+MEDIA_SCALE_PROP = QTextFormat.UserProperty + 14  # float, display-size multiplier set from the "Settings" > resize menu (default 1.0)
+MEDIA_OBJECT_TYPE = QTextFormat.UserObject + 1
+MEDIA_SCALE_MIN = 0.1
+MEDIA_SCALE_MAX = 4.0
+
+IMAGE_MEDIA_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".svg", ".ico", ".tif", ".tiff"}
+GIF_MEDIA_EXTENSIONS = {".gif"}
+VIDEO_MEDIA_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".wmv", ".flv", ".m4v", ".mpg", ".mpeg"}
+AUDIO_MEDIA_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".wma", ".opus"}
+MEDIA_MAX_WIDTH = 480
+
+
+def _is_url(src):
+    return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", src or ""))
+
+
+def classify_media_path(src):
+    """Return "image"/"gif"/"video"/"audio" for a path or URL recognized as
+    an embeddable media file by its extension, or None for anything else
+    (which should be treated as a plain hyperlink instead)."""
+    if not src:
+        return None
+    clean = src
+    if _is_url(clean):
+        clean = clean.split("?", 1)[0].split("#", 1)[0]
+    ext = os.path.splitext(clean)[1].lower()
+    if ext in IMAGE_MEDIA_EXTENSIONS:
+        return "image"
+    if ext in GIF_MEDIA_EXTENSIONS:
+        return "gif"
+    if ext in VIDEO_MEDIA_EXTENSIONS:
+        return "video"
+    if ext in AUDIO_MEDIA_EXTENSIONS:
+        return "audio"
+    return None
+
+
+def resolve_media_path(src, base_dir):
+    """Resolve a media source exactly like it should be interpreted:
+    - a URL (http://, https://, ...) is returned unchanged
+    - an absolute local path (C:\\..., /..., a file:// URI, ~/...) is
+      returned as an absolute path
+    - anything else (".\\pic.png", "pic.png", "..\\folder\\a.mp4") is
+      treated as relative to the folder the current .md document is saved
+      in (falling back to the current working directory if the document
+      hasn't been saved yet)
+    Returns (resolved_path_or_url, is_remote_url).
+    """
+    if not src:
+        return src, False
+    if src.startswith("file:///") or src.startswith("file://"):
+        # Checked before the generic _is_url() test below - "file://" also
+        # matches a generic "scheme://" pattern, but it's a local path in
+        # disguise, not something to fetch over the network.
+        return os.path.normpath(QUrl(src).toLocalFile()), False
+    if _is_url(src):
+        return src, True
+    # Accept both "\" and "/" as a separator regardless of the OS this
+    # happens to run on, since Markdown written on Windows (the primary
+    # target platform, hence examples like "C:\Videos\video.mp4") is
+    # routinely opened/edited elsewhere too.
+    path = src.replace("\\", "/")
+    path = os.path.expanduser(path)
+    is_windows_abs = bool(re.match(r"^[a-zA-Z]:[\\/]", path))
+    is_unc = path.startswith("//")
+    if not (os.path.isabs(path) or is_windows_abs or is_unc):
+        base = base_dir or os.getcwd()
+        path = os.path.normpath(os.path.join(base, path))
+    return path, False
+
+
+_MD_IMAGE_SYNTAX_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+
+
+def extract_media_alt_map(content):
+    """Scan raw Markdown source (outside fenced code blocks) for
+    ![alt](src) occurrences, in document order, and return them as a list
+    of (alt, src) tuples. Needed because Qt's own Markdown importer parses
+    this same syntax into an image but silently discards the alt text -
+    this is the only way to recover it, matched back up by position right
+    after setMarkdown() runs (see Editor.replace_media_placeholders)."""
+    results = []
+    in_code_block = False
+    for line in content.split('\n'):
+        stripped = line.lstrip()
+        if stripped.startswith('```'):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+        for m in _MD_IMAGE_SYNTAX_RE.finditer(line):
+            alt, src = m.group(1), m.group(2).strip()
+            src = src.split(' ', 1)[0].strip('<>')  # drop an optional "title" and any <...> wrapping
+            results.append((alt, src))
+    return results
 
 # --- Toolbar icons ---
 # Simple, original monoline glyphs (20x20 viewBox). "{color}" is filled in
@@ -210,6 +337,19 @@ TOOLBAR_SVG_ICONS = {
           <path fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"
                 d="M5.5 5.5 14.5 14.5 M14.5 5.5 5.5 14.5"/>
         </svg>""",
+    "media": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <defs><clipPath id="mediaScreenClip"><rect x="2.5" y="6" width="15" height="10" rx="1.3"/></clipPath></defs>
+          <path fill="none" stroke="{color}" stroke-width="1.6" stroke-linecap="round"
+                d="M6.5 3.2 3.3 6.2 M13.5 3.2 16.7 6.2"/>
+          <g clip-path="url(#mediaScreenClip)">
+            <rect fill="{color}" opacity="0.15" x="2.5" y="6" width="15" height="10"/>
+            <circle fill="{color}" cx="13.1" cy="9.1" r="1.3"/>
+            <path fill="{color}" d="M2.5 16 6.5 10.1 9 12.8 11.5 9.5 17.5 16 Z"/>
+          </g>
+          <rect fill="none" stroke="{color}" stroke-width="1.6" x="2.5" y="6" width="15" height="10" rx="1.3"/>
+          <rect fill="{color}" x="7.7" y="16.6" width="4.6" height="1.1" rx="0.5"/>
+        </svg>""",
 }
 
 
@@ -229,6 +369,117 @@ def make_svg_icon(name, color, size=18):
     renderer.render(painter)
     painter.end()
     return QIcon(pixmap)
+
+class _MediaDownloadThread(QThread):
+    """Downloads a remote image/gif (http:// or https://) off the UI
+    thread, so a slow or unreachable URL never freezes the editor. Video
+    and audio don't need this - QMediaPlayer streams URLs on its own."""
+    finished_download = Signal(str, object)  # src, bytes or None
+
+    def __init__(self, src, parent=None):
+        super().__init__(parent)
+        self.src = src
+
+    def run(self):
+        data = None
+        try:
+            req = urllib.request.Request(self.src, headers={"User-Agent": "Mozilla/5.0 (MPad++)"})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = resp.read()
+        except Exception:
+            data = None
+        self.finished_download.emit(self.src, data)
+
+
+class MediaPlayerController(QObject):
+    """Owns the actual QMediaPlayer for one embedded audio/video object and
+    exposes just what the inline player needs to draw and to react to
+    clicks: play/pause, current position, and (for video) the latest
+    decoded frame as a QImage."""
+    changed = Signal()
+
+    def __init__(self, media_type, source, is_remote, parent=None):
+        super().__init__(parent)
+        self.media_type = media_type
+        self.current_frame = None
+        self.error_text = None
+        self.player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio_output)
+        self.video_sink = None
+        if media_type == "video":
+            self.video_sink = QVideoSink(self)
+            self.player.setVideoSink(self.video_sink)
+            self.video_sink.videoFrameChanged.connect(self._on_frame)
+        self.player.setSource(QUrl(source) if is_remote else QUrl.fromLocalFile(source))
+        self.player.positionChanged.connect(lambda _v: self.changed.emit())
+        self.player.durationChanged.connect(lambda _v: self.changed.emit())
+        self.player.playbackStateChanged.connect(lambda _v: self.changed.emit())
+        self.player.errorOccurred.connect(self._on_error)
+
+    def _on_error(self, _error, error_string):
+        self.error_text = error_string or "unknown error"
+        self.changed.emit()
+
+    def _on_frame(self, frame):
+        if frame.isValid():
+            img = frame.toImage()
+            if not img.isNull():
+                self.current_frame = img
+        self.changed.emit()
+
+    def toggle_play(self):
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def is_playing(self):
+        return self.player.playbackState() == QMediaPlayer.PlayingState
+
+    def position_fraction(self):
+        dur = self.player.duration()
+        return (self.player.position() / dur) if dur > 0 else 0.0
+
+    def seek_fraction(self, frac):
+        dur = self.player.duration()
+        if dur > 0:
+            self.player.setPosition(int(max(0.0, min(1.0, frac)) * dur))
+
+    def time_text(self):
+        def fmt(ms):
+            s = max(0, ms) // 1000
+            return f"{s // 60:02d}:{s % 60:02d}"
+        return f"{fmt(self.player.position())} / {fmt(self.player.duration())}"
+
+    def stop_and_release(self):
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+
+
+class MediaTextObject(QPyTextObject):
+    """QTextObjectInterface handler registered on each Editor's document
+    layout, responsible for sizing and painting every embedded media
+    object (image/gif/video/audio). Actual sizing/loading/drawing logic
+    lives on the Editor itself (see Editor.media_intrinsic_size /
+    Editor.draw_media_object) so it has easy access to per-tab caches.
+    Uses QPyTextObject (PySide's QObject+QTextObjectInterface combo
+    helper) rather than plain multiple inheritance - the latter silently
+    never gets its intrinsicSize()/drawObject() invoked by Qt's layout
+    engine in PySide6."""
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+
+    def intrinsicSize(self, doc, posInDocument, fmt):
+        return self.editor.media_intrinsic_size(fmt)
+
+    def drawObject(self, painter, rect, doc, posInDocument, fmt):
+        self.editor.draw_media_object(painter, rect, fmt)
+
 
 class LineNumberArea(QWidget):
     def __init__(self, editor):
@@ -854,6 +1105,170 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
             self.rehighlightBlock(block)
 
 
+def _is_local_file_href(href):
+    """True if a hyperlink target should be treated as a local file rather
+    than a web address: an explicit file:// URI, or any plain path that
+    doesn't look like some other URL scheme (http://, mailto:, ftp://, ...).
+    This deliberately also covers *relative* paths (".\\plik.pdf",
+    "plik.pdf", "..\\folder\\plik.pdf") - not just absolute ones - since
+    those are resolved later, at open time, against the folder of the
+    currently saved .md document (see open_hyperlink/resolve_media_path)."""
+    if not href:
+        return False
+    if href.startswith("file://"):
+        return True  # checked first: also matches the generic scheme:// test below
+    if href.startswith("mailto:"):
+        return False
+    if _is_url(href):
+        return False  # some other URL scheme (http, https, ftp, ...)
+    return True
+
+
+def open_hyperlink(href, base_dir=None):
+    """Open a hyperlink's target: local files are launched the way the
+    system file explorer would (using the file's default association),
+    everything else opens in the default web browser. A local target can
+    be absolute (C:\\..., /..., ~/..., a file:// URI) or relative - such
+    as ".\\plik.pdf" or "..\\docs\\readme.pdf" - in which case it's
+    resolved against `base_dir` (normally the folder the current .md
+    document is saved in; see Editor.get_media_base_dir)."""
+    if _is_local_file_href(href):
+        local_path, _is_remote = resolve_media_path(href, base_dir)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(local_path)):
+            QMessageBox.warning(None, "MPad++", f"Could not open file:\n{local_path}")
+    else:
+        webbrowser.open(href, new=2)
+
+
+# --- Table column alignment ---
+#
+# Markdown only supports aligning a table by whole COLUMN - the
+# ":---"/"---:"/":---:" marker in a column's separator cell applies to
+# every row of that column alike, there's no such thing as "just the
+# header row" or "just the data rows" in the format itself. So alignment
+# here is read from and written straight to the document's actual cell
+# formatting (the same thing get_inline_md()/export_table_to_md() already
+# read everything else from) instead of being kept as a separate
+# app-only setting (globally in Preferences, or per-table on the
+# QTextTableFormat) that only this program would ever know how to read
+# back - that state doesn't exist anywhere once the file leaves this app,
+# so it doesn't belong outside the Markdown text itself.
+_TABLE_ALIGN_QT = {"left": Qt.AlignLeft, "center": Qt.AlignHCenter, "right": Qt.AlignRight}
+
+
+def get_table_column_alignment(table, col):
+    """Read a table column's current alignment ("left"/"center"/"right") from
+    its header cell's paragraph alignment."""
+    cell = table.cellAt(0, col)
+    it = cell.begin()
+    while not it.atEnd():
+        blk = it.currentBlock()
+        if blk.isValid():
+            align = blk.blockFormat().alignment()
+            if align & Qt.AlignHCenter:
+                return "center"
+            if align & Qt.AlignRight:
+                return "right"
+            return "left"
+        it += 1
+    return "left"
+
+
+def set_table_column_alignment(table, col, align_key):
+    """Apply an alignment to every cell in one table column (all rows alike),
+    which is the only granularity real Markdown table alignment has."""
+    align = _TABLE_ALIGN_QT.get(align_key, Qt.AlignLeft)
+    for r in range(table.rows()):
+        cell = table.cellAt(r, col)
+        it = cell.begin()
+        while not it.atEnd():
+            blk = it.currentBlock()
+            if blk.isValid():
+                blk_cursor = QTextCursor(blk)
+                blk_fmt = blk_cursor.blockFormat()
+                if blk_fmt.alignment() != align:
+                    blk_fmt.setAlignment(align)
+                    blk_cursor.setBlockFormat(blk_fmt)
+            it += 1
+
+
+def sync_table_column_alignments(table):
+    """Re-apply every column's current (header-row) alignment across all of
+    its rows. Needed after inserting a row: the new row's cells start out
+    with no explicit alignment, which would otherwise leave that one row
+    out of step with the rest of its column."""
+    for c in range(table.columns()):
+        set_table_column_alignment(table, c, get_table_column_alignment(table, c))
+
+
+_TABLE_SEP_CELL_RE = re.compile(r'^:?-+:?$')
+
+
+def parse_markdown_table_alignments(source_text):
+    """Scan raw Markdown text for GFM table separator rows and return a list
+    of per-table column-alignment lists (one entry per table, in the order
+    the tables appear), e.g. [["left", "center", "right"], ...].
+
+    This exists because Qt's own Markdown importer (QTextDocument.setMarkdown)
+    parses the table itself but silently discards the alignment markers in
+    the process - so the only way to recover them is to read the source text
+    directly, then reapply them to the resulting QTextTable afterward.
+    """
+    lines = source_text.splitlines()
+
+    def split_row(line):
+        line = line.strip()
+        if line.startswith('|'):
+            line = line[1:]
+        if line.endswith('|'):
+            line = line[:-1]
+        return [c.strip() for c in line.split('|')]
+
+    tables_align = []
+    for i in range(1, len(lines)):
+        line = lines[i]
+        if '|' not in line:
+            continue
+        prev = lines[i - 1]
+        if '|' not in prev or not prev.strip():
+            continue
+        cells = split_row(line)
+        if not cells or not all(_TABLE_SEP_CELL_RE.match(c) for c in cells):
+            continue
+        aligns = []
+        for c in cells:
+            if c.startswith(':') and c.endswith(':'):
+                aligns.append("center")
+            elif c.endswith(':'):
+                aligns.append("right")
+            else:
+                aligns.append("left")
+        tables_align.append(aligns)
+    return tables_align
+
+
+def apply_markdown_table_alignments(document, tables_align):
+    """Reapply the per-table column alignments parse_markdown_table_alignments()
+    recovered from source text onto the QTextTables setMarkdown() just built,
+    matching them up in document order."""
+    if not tables_align:
+        return
+    cursor = QTextCursor(document)
+    cursor.movePosition(QTextCursor.Start)
+    idx = 0
+    while idx < len(tables_align):
+        table = cursor.currentTable()
+        if table:
+            aligns = tables_align[idx]
+            idx += 1
+            for c in range(min(table.columns(), len(aligns))):
+                set_table_column_alignment(table, c, aligns[c])
+            cursor.setPosition(table.lastPosition() + 1, QTextCursor.MoveAnchor)
+        else:
+            if not cursor.movePosition(QTextCursor.NextBlock):
+                break
+
+
 class Editor(QTextEdit):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -862,6 +1277,19 @@ class Editor(QTextEdit):
         self.view_mode = "formatted"
         self.setAcceptDrops(True)
         self.apply_settings()
+
+        # --- Embedded media (image/gif/video/audio) ---
+        # One handler per editor/document, registered for MEDIA_OBJECT_TYPE
+        # so every ![alt](src) that resolves to a recognized media file
+        # gets painted as a real inline picture, animation, or player
+        # instead of plain text.
+        self._media_object_handler = MediaTextObject(self)
+        self.document().documentLayout().registerHandler(MEDIA_OBJECT_TYPE, self._media_object_handler)
+        self._media_pixmap_cache = {}      # src -> QPixmap or None (failed/pending)
+        self._media_movie_cache = {}       # src -> (QMovie, QBuffer-or-None) or None
+        self._media_controllers = {}       # media_id -> MediaPlayerController
+        self._media_download_threads = {}  # src -> _MediaDownloadThread (kept alive)
+        self._media_download_kind = {}     # src -> "image" | "gif"
 
         # --- Custom cursor rendering ---
         # Qt's built-in text cursor (driven by QWidgetTextControl's internal
@@ -875,6 +1303,8 @@ class Editor(QTextEdit):
         # blink/focus bookkeeping surviving a document reload.
         self.setCursorWidth(0)
         self._caret_visible = True
+        self._code_copy_icon_rects = []   # [(QRect, block_start_pos, block_end_pos)], set in paintEvent
+        self._code_copy_hover_pos = None
         self._caret_timer = QTimer(self)
         self._caret_timer.timeout.connect(self._toggle_caret)
         flash_time = QApplication.cursorFlashTime()
@@ -1185,6 +1615,58 @@ class Editor(QTextEdit):
             hr_block = hr_block.next()
         hr_painter.end()
 
+        # Draw a small "copy" button in the top-right corner of every code
+        # block, one per contiguous run of code-formatted blocks (a fenced
+        # multi-line code block gets exactly one button, not one per line).
+        self._code_copy_icon_rects = []   # [(QRect, start_block_pos, end_block_pos_end)]
+        icon_painter = QPainter(self.viewport())
+        icon_painter.setRenderHint(QPainter.Antialiasing, True)
+        icon_size = 16
+        icon_margin = 6
+
+        def is_code_block(b):
+            return (b.isValid() and b.isVisible()
+                    and b.blockFormat().hasProperty(BLOCK_CODE_PROP)
+                    and b.blockFormat().property(BLOCK_CODE_PROP) == True)
+
+        code_block = self.document().firstBlock()
+        while code_block.isValid():
+            if not is_code_block(code_block):
+                code_block = code_block.next()
+                continue
+            region_start = code_block
+            region_end = code_block
+            nxt = code_block.next()
+            while is_code_block(nxt):
+                region_end = nxt
+                nxt = nxt.next()
+
+            start_rect = self.document().documentLayout().blockBoundingRect(region_start)
+            top = int(start_rect.top() - self.verticalScrollBar().value())
+            if -icon_size <= top <= viewport_height:
+                btn_x = self.viewport().width() - icon_size - icon_margin - 2
+                btn_y = top + icon_margin
+                btn_rect = QRect(btn_x, btn_y, icon_size, icon_size)
+                hovered = btn_rect.contains(self._code_copy_hover_pos) if self._code_copy_hover_pos else False
+                bg = QColor(self.settings.get('editor_text', '#e6e6e6'))
+                bg.setAlpha(60 if hovered else 30)
+                icon_painter.setPen(Qt.NoPen)
+                icon_painter.setBrush(bg)
+                icon_painter.drawRoundedRect(btn_rect, 4, 4)
+                pen_color = QColor(self.settings.get('editor_text', '#e6e6e6'))
+                icon_painter.setPen(QPen(pen_color, 1.3))
+                icon_painter.setBrush(Qt.NoBrush)
+                # Two overlapping rounded rectangles - the universal "copy" glyph.
+                back = QRectF(btn_x + 3, btn_y + 5, 8, 8)
+                front = QRectF(btn_x + 5, btn_y + 3, 8, 8)
+                icon_painter.drawRoundedRect(back, 1.5, 1.5)
+                icon_painter.fillRect(front, QColor(self.settings.get('editor_bg', '#1e1e1e')))
+                icon_painter.drawRoundedRect(front, 1.5, 1.5)
+                self._code_copy_icon_rects.append((btn_rect, region_start.position(),
+                                                    region_end.position() + region_end.length() - 1))
+            code_block = nxt
+        icon_painter.end()
+
         # Draw our own caret (see __init__ comment for why Qt's built-in
         # cursor rendering is disabled). Drawn last so it's always on top.
         if self.hasFocus() and self._caret_visible and not self.textCursor().hasSelection():
@@ -1314,7 +1796,15 @@ class Editor(QTextEdit):
 
     def mouseMoveEvent(self, event):
         pos = event.position().toPoint()
-        if self.anchorAt(pos):
+        self._code_copy_hover_pos = pos
+        hovered_icon = any(rect.contains(pos) for rect, _, _ in self._code_copy_icon_rects)
+        media_hit = self._media_object_at(pos)
+        if hovered_icon:
+            self.viewport().setCursor(Qt.PointingHandCursor)
+            self.viewport().update()
+        elif media_hit is not None and media_hit[0].property(MEDIA_TYPE_PROP) in ("video", "audio"):
+            self.viewport().setCursor(Qt.PointingHandCursor)
+        elif self.anchorAt(pos):
             self.viewport().setCursor(Qt.PointingHandCursor)
         else:
             self.viewport().setCursor(Qt.IBeamCursor)
@@ -1323,10 +1813,501 @@ class Editor(QTextEdit):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             pos = event.position().toPoint()
+            for rect, start_pos, end_pos in self._code_copy_icon_rects:
+                if rect.contains(pos):
+                    copy_cursor = QTextCursor(self.document())
+                    copy_cursor.setPosition(start_pos)
+                    copy_cursor.setPosition(end_pos, QTextCursor.KeepAnchor)
+                    QApplication.clipboard().setText(copy_cursor.selectedText().replace('\u2029', '\n'))
+                    QToolTip.showText(event.globalPosition().toPoint(), "Skopiowano!", self, rect, 1200)
+                    return  # don't let this click also move the text cursor/selection
+            media_hit = self._media_object_at(pos)
+            if media_hit is not None:
+                fmt, rect, _obj_pos = media_hit
+                if self._handle_media_click(fmt, rect, pos):
+                    return  # click was consumed by the play/pause control
             anchor = self.anchorAt(pos)
             if anchor:
-                webbrowser.open(anchor, new=2)
+                open_hyperlink(anchor, self.get_media_base_dir())
         super().mousePressEvent(event)
+
+    def _media_object_at(self, pos):
+        """Hit-test a viewport point against embedded media objects. Returns
+        (charFormat, rect_in_viewport, doc_position) for the object under
+        `pos`, or None.
+
+        This used to derive a single "clicked" document position from
+        cursorForPosition() and only test the one or two character slots
+        immediately around it. That works fine for a media object sitting
+        alone on its line, but breaks as soon as the same paragraph
+        continues with more text after the object: cursorForPosition()'s
+        x/y snapping can then land a pixel-perfect click on the object
+        several character slots away from where the object itself lives
+        (inside the following text run), so the old two-candidate probe
+        never found it and the click fell straight through to the editor's
+        own text-cursor placement instead of the video/audio/image object.
+
+        Fixed by not guessing a document position from the click at all:
+        instead, walk every fragment of the block(s) near the click (plus
+        one block of margin on each side, in case the object's own line
+        wrapped) and test the click point directly against each media
+        object's real on-screen rect. That rect is still derived from the
+        cursor boundary rects immediately before/after the object (its
+        width in the line) combined with its intrinsic height, since Qt
+        doesn't expose inline-object geometry any more directly than that."""
+        doc = self.document()
+        last = doc.characterCount() - 1
+        hit_block = self.cursorForPosition(pos).block()
+        blocks = [hit_block]
+        if hit_block.previous().isValid():
+            blocks.append(hit_block.previous())
+        if hit_block.next().isValid():
+            blocks.append(hit_block.next())
+
+        seen = set()
+        for block in blocks:
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                it += 1
+                if not frag.isValid():
+                    continue
+                fmt = frag.charFormat()
+                if fmt.objectType() != MEDIA_OBJECT_TYPE:
+                    continue
+                obj_pos = frag.position()
+                if obj_pos in seen or obj_pos <= 0 or obj_pos > last:
+                    continue
+                seen.add(obj_pos)
+                before = QTextCursor(doc)
+                before.setPosition(obj_pos)
+                after = QTextCursor(doc)
+                after.setPosition(min(obj_pos + 1, last))
+                left_rect = self.cursorRect(before)
+                right_rect = self.cursorRect(after)
+                height = self.media_intrinsic_size(fmt).height()
+                rect = QRect(left_rect.left(), left_rect.top(),
+                             max(1, right_rect.left() - left_rect.left()), int(height))
+                if rect.contains(pos):
+                    return fmt, rect, obj_pos
+        return None
+
+    def _handle_media_click(self, fmt, rect, pos):
+        media_type = fmt.property(MEDIA_TYPE_PROP)
+        if media_type not in ("video", "audio"):
+            return False
+        if not HAVE_MULTIMEDIA:
+            return True  # still swallow the click - nothing to play
+        media_id = fmt.property(MEDIA_ID_PROP) or ""
+        src = fmt.property(MEDIA_SRC_PROP) or ""
+        resolved, is_remote = resolve_media_path(src, self.get_media_base_dir())
+        ctrl = self.get_media_controller(media_id, media_type, resolved, is_remote)
+        if ctrl is None:
+            return True
+        # Clicking the bottom-most strip of a video (its control bar), or
+        # anywhere on the (thin) audio bar, either toggles play/pause or
+        # seeks depending on exactly where within the bar the click lands;
+        # clicking the rest of a video toggles play/pause - matching a
+        # typical inline player. The x-ranges below must mirror the ones
+        # the bar is actually painted with in _draw_media_video /
+        # _draw_media_audio (icon column, progress track, time label) -
+        # previously this used the *whole* bar width for seeking, which
+        # both made seeking imprecise (it didn't line up with the visibly
+        # narrower progress track) and made the play/pause icon itself
+        # unclickable (a click on it was always misread as a seek).
+        if media_type == "video":
+            bar_top = rect.bottom() - 26
+            if pos.y() >= bar_top and rect.width() > 0:
+                progress_left = rect.left() + 32
+                progress_width = max(0, rect.width() - 140)
+                if pos.x() < progress_left:
+                    ctrl.toggle_play()
+                elif progress_width > 0 and pos.x() < progress_left + progress_width:
+                    frac = (pos.x() - progress_left) / progress_width
+                    ctrl.seek_fraction(frac)
+                # else: click landed on the time label - swallow, no action
+                return True
+            ctrl.toggle_play()
+            return True
+        if media_type == "audio":
+            progress_left = rect.left() + 46
+            progress_width = max(0, rect.width() - 132)
+            if pos.x() < progress_left:
+                ctrl.toggle_play()
+            elif progress_width > 0 and pos.x() < progress_left + progress_width:
+                frac = (pos.x() - progress_left) / progress_width
+                ctrl.seek_fraction(frac)
+            else:
+                ctrl.toggle_play()
+            return True
+        ctrl.toggle_play()
+        return True
+
+    # --- Embedded media: loading, sizing, painting ---
+
+    def get_media_base_dir(self):
+        """Folder relative paths (".\\pic.png", "sub\\clip.mp4", ...) are
+        resolved against - the folder the current .md document lives in,
+        or the working directory for a not-yet-saved document."""
+        if self.current_file:
+            return os.path.dirname(os.path.abspath(self.current_file))
+        return os.getcwd()
+
+    def media_intrinsic_size(self, fmt):
+        media_type = fmt.property(MEDIA_TYPE_PROP)
+        src = fmt.property(MEDIA_SRC_PROP) or ""
+        resolved, is_remote = resolve_media_path(src, self.get_media_base_dir())
+
+        if media_type in ("image", "gif"):
+            pix = (self.get_media_movie(src, resolved, is_remote).currentPixmap()
+                   if media_type == "gif" and self.get_media_movie(src, resolved, is_remote)
+                   else self.get_media_pixmap(src, resolved, is_remote))
+            if pix and not pix.isNull() and pix.width() > 0:
+                w = min(pix.width(), MEDIA_MAX_WIDTH)
+                h = pix.height() * (w / pix.width())
+                base = QSizeF(w, h)
+            else:
+                base = QSizeF(220, 140)
+        elif media_type == "video":
+            base = QSizeF(MEDIA_MAX_WIDTH, 290)
+        elif media_type == "audio":
+            base = QSizeF(min(MEDIA_MAX_WIDTH, 420), 56)
+        else:
+            base = QSizeF(160, 40)
+
+        # A display-size multiplier, applied uniformly to both dimensions so
+        # aspect ratio is always preserved. Only ever set on documents
+        # created by older versions of the app (the context-menu action that
+        # used to set this has been removed); still honored here so those
+        # documents keep rendering the way they were saved.
+        scale = fmt.property(MEDIA_SCALE_PROP)
+        if scale and scale != 1.0:
+            scale = max(MEDIA_SCALE_MIN, min(MEDIA_SCALE_MAX, float(scale)))
+            base = QSizeF(base.width() * scale, base.height() * scale)
+
+        # Settings > Preferences > General lets the user set a minimum
+        # display width (in px) per media type, so small images/gifs/videos
+        # never render illegibly tiny. Aspect ratio is preserved.
+        min_width = self._min_media_width_for(media_type)
+        if min_width and base.width() > 0 and base.width() < min_width:
+            ratio = min_width / base.width()
+            base = QSizeF(min_width, base.height() * ratio)
+
+        return base
+
+    def _min_media_width_for(self, media_type):
+        key = {
+            "image": "media_min_width_image",
+            "gif": "media_min_width_gif",
+            "video": "media_min_width_video",
+        }.get(media_type)
+        if key is None:
+            return 0
+        try:
+            return max(0, int(self.settings.get(key, 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def get_media_pixmap(self, src, resolved, is_remote):
+        cache = self._media_pixmap_cache
+        if src in cache:
+            return cache[src]
+        if is_remote:
+            cache[src] = None
+            self._start_media_download(src, "image")
+            return None
+        pix = QPixmap(resolved)
+        cache[src] = pix if not pix.isNull() else None
+        return cache[src]
+
+    def get_media_movie(self, src, resolved, is_remote):
+        cache = self._media_movie_cache
+        if src in cache:
+            return cache[src][0] if cache[src] else None
+        if is_remote:
+            cache[src] = None
+            self._start_media_download(src, "gif")
+            return None
+        movie = QMovie(resolved)
+        if not movie.isValid():
+            cache[src] = None
+            return None
+        movie.setCacheMode(QMovie.CacheAll)
+        movie.frameChanged.connect(lambda _f: self.viewport().update())
+        movie.start()
+        cache[src] = (movie, None)
+        return movie
+
+    def _start_media_download(self, src, kind):
+        if src in self._media_download_threads:
+            return
+        thread = _MediaDownloadThread(src, self)
+        self._media_download_kind[src] = kind
+        thread.finished_download.connect(self._on_media_downloaded)
+        self._media_download_threads[src] = thread
+        thread.start()
+
+    def _on_media_downloaded(self, src, data):
+        kind = self._media_download_kind.pop(src, "image")
+        self._media_download_threads.pop(src, None)
+        if kind == "gif":
+            movie = None
+            if data:
+                buf = QBuffer(self)
+                buf.setData(QByteArray(data))
+                buf.open(QIODevice.ReadOnly)
+                candidate = QMovie()
+                candidate.setDevice(buf)
+                if candidate.isValid():
+                    candidate.setCacheMode(QMovie.CacheAll)
+                    candidate.frameChanged.connect(lambda _f: self.viewport().update())
+                    candidate.start()
+                    movie = (candidate, buf)
+            self._media_movie_cache[src] = movie
+        else:
+            pix = None
+            if data:
+                candidate = QPixmap()
+                if candidate.loadFromData(data):
+                    pix = candidate
+            self._media_pixmap_cache[src] = pix
+        # The real size is only known now - force the document to relayout
+        # so the object stops using its placeholder size.
+        self.document().markContentsDirty(0, self.document().characterCount())
+        self.viewport().update()
+
+    def get_media_controller(self, media_id, media_type, resolved, is_remote):
+        if not HAVE_MULTIMEDIA:
+            return None
+        ctrl = self._media_controllers.get(media_id)
+        if ctrl is None:
+            ctrl = MediaPlayerController(media_type, resolved, is_remote, self)
+            ctrl.changed.connect(self.viewport().update)
+            self._media_controllers[media_id] = ctrl
+        return ctrl
+
+    def draw_media_object(self, painter, rect, fmt):
+        media_type = fmt.property(MEDIA_TYPE_PROP)
+        src = fmt.property(MEDIA_SRC_PROP) or ""
+        alt = fmt.property(MEDIA_ALT_PROP) or ""
+        media_id = fmt.property(MEDIA_ID_PROP) or ""
+        resolved, is_remote = resolve_media_path(src, self.get_media_base_dir())
+
+        painter.save()
+        try:
+            if media_type in ("image", "gif"):
+                self._draw_media_image(painter, rect, src, resolved, is_remote, media_type, alt)
+            elif media_type == "video":
+                self._draw_media_video(painter, rect, media_id, resolved, is_remote, alt)
+            elif media_type == "audio":
+                self._draw_media_audio(painter, rect, media_id, resolved, is_remote, alt)
+        finally:
+            painter.restore()
+
+    def _draw_media_image(self, painter, rect, src, resolved, is_remote, media_type, alt):
+        if media_type == "gif":
+            movie = self.get_media_movie(src, resolved, is_remote)
+            pix = movie.currentPixmap() if movie else None
+        else:
+            pix = self.get_media_pixmap(src, resolved, is_remote)
+        if pix and not pix.isNull():
+            target = pix.scaled(rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = rect.left() + (rect.width() - target.width()) / 2
+            y = rect.top() + (rect.height() - target.height()) / 2
+            painter.drawPixmap(int(x), int(y), target)
+        else:
+            subtitle = "Loading…" if is_remote else "Could not load image"
+            self._draw_media_placeholder(painter, rect, "🖼", alt or os.path.basename(resolved), subtitle)
+
+    def _draw_media_placeholder(self, painter, rect, icon_char, title, subtitle):
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#2a2a2a"))
+        painter.drawRoundedRect(rect, 6, 6)
+        painter.setPen(QColor("#8a8a8a"))
+        f = painter.font()
+        f.setPointSize(18)
+        painter.setFont(f)
+        painter.drawText(QRectF(rect.left(), rect.top(), rect.width(), rect.height() - 20),
+                          Qt.AlignCenter, icon_char)
+        f2 = painter.font()
+        f2.setPointSize(8)
+        painter.setFont(f2)
+        painter.setPen(QColor("#aaaaaa"))
+        label = f"{title} — {subtitle}" if subtitle else title
+        elided = QFontMetrics(f2).elidedText(label, Qt.ElideMiddle, max(10, int(rect.width() - 8)))
+        painter.drawText(QRectF(rect.left() + 4, rect.bottom() - 18, rect.width() - 8, 16),
+                          Qt.AlignLeft | Qt.AlignVCenter, elided)
+
+    def _draw_media_video(self, painter, rect, media_id, resolved, is_remote, alt):
+        if not HAVE_MULTIMEDIA:
+            self._draw_media_placeholder(painter, rect, "🎬", alt or os.path.basename(resolved),
+                                          "Install PySide6-Addons (QtMultimedia)")
+            return
+        ctrl = self.get_media_controller(media_id, "video", resolved, is_remote)
+        bar_h = 26
+        video_rect = QRectF(rect.left(), rect.top(), rect.width(), rect.height() - bar_h)
+        bar_rect = QRectF(rect.left(), rect.bottom() - bar_h, rect.width(), bar_h)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#000000"))
+        painter.drawRect(video_rect)
+
+        if ctrl.error_text:
+            painter.setPen(QColor("#ff8080"))
+            f = painter.font(); f.setPointSize(8); painter.setFont(f)
+            painter.drawText(video_rect, Qt.AlignCenter, "Playback error:\n" + ctrl.error_text)
+        elif ctrl.current_frame is not None:
+            scaled = ctrl.current_frame.scaled(video_rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = video_rect.left() + (video_rect.width() - scaled.width()) / 2
+            y = video_rect.top() + (video_rect.height() - scaled.height()) / 2
+            painter.drawImage(int(x), int(y), scaled)
+        else:
+            painter.setPen(QColor("#dddddd"))
+            f = painter.font(); f.setPointSize(20); painter.setFont(f)
+            painter.drawText(video_rect, Qt.AlignCenter, "▶")
+            f2 = painter.font(); f2.setPointSize(8); painter.setFont(f2)
+            painter.setFont(f2)
+            painter.setPen(QColor("#999999"))
+            label = QFontMetrics(f2).elidedText(alt or os.path.basename(resolved), Qt.ElideMiddle, int(video_rect.width() - 8))
+            painter.drawText(QRectF(video_rect.left(), video_rect.bottom() - 18, video_rect.width(), 16), Qt.AlignCenter, label)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#1c1c1c"))
+        painter.drawRect(bar_rect)
+
+        painter.setPen(QColor("#ffffff"))
+        f = painter.font(); f.setPointSize(10); painter.setFont(f)
+        icon = "⏸" if ctrl.is_playing() else "▶"
+        painter.drawText(QRectF(bar_rect.left() + 6, bar_rect.top(), 24, bar_rect.height()),
+                          Qt.AlignVCenter | Qt.AlignLeft, icon)
+
+        progress_rect = QRectF(bar_rect.left() + 32, bar_rect.top() + bar_rect.height() / 2 - 2,
+                                max(0, bar_rect.width() - 140), 4)
+        painter.setBrush(QColor("#444444"))
+        painter.drawRoundedRect(progress_rect, 2, 2)
+        frac = ctrl.position_fraction()
+        painter.setBrush(QColor(self.settings.get("link", "#3794ff")))
+        painter.drawRoundedRect(QRectF(progress_rect.left(), progress_rect.top(),
+                                        progress_rect.width() * frac, progress_rect.height()), 2, 2)
+
+        painter.setPen(QColor("#cccccc"))
+        f3 = painter.font(); f3.setPointSize(7); painter.setFont(f3)
+        painter.drawText(QRectF(bar_rect.right() - 104, bar_rect.top(), 100, bar_rect.height()),
+                          Qt.AlignVCenter | Qt.AlignRight, ctrl.time_text())
+
+    def _draw_media_audio(self, painter, rect, media_id, resolved, is_remote, alt):
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#2a2a2a"))
+        painter.drawRoundedRect(rect, 8, 8)
+
+        if not HAVE_MULTIMEDIA:
+            self._draw_media_placeholder(painter, rect, "🎵", alt or os.path.basename(resolved),
+                                          "Install PySide6-Addons (QtMultimedia)")
+            return
+        ctrl = self.get_media_controller(media_id, "audio", resolved, is_remote)
+
+        icon_circle = QRectF(rect.left() + 8, rect.top() + rect.height() / 2 - 14, 28, 28)
+        painter.setBrush(QColor(self.settings.get("link", "#3794ff")))
+        painter.drawEllipse(icon_circle)
+        painter.setPen(QColor("#ffffff"))
+        f = painter.font(); f.setPointSize(11); painter.setFont(f)
+        painter.drawText(icon_circle, Qt.AlignCenter, "⏸" if ctrl.is_playing() else "▶")
+
+        title = alt or os.path.basename(resolved)
+        f2 = painter.font(); f2.setPointSize(8); painter.setFont(f2)
+        painter.setPen(QColor("#e0e0e0"))
+        name_rect = QRectF(rect.left() + 46, rect.top() + 6, rect.width() - 58, 16)
+        painter.drawText(name_rect, Qt.AlignLeft | Qt.AlignVCenter,
+                          QFontMetrics(f2).elidedText(title, Qt.ElideMiddle, max(10, int(name_rect.width()))))
+
+        if ctrl.error_text:
+            painter.setPen(QColor("#ff8080"))
+            painter.drawText(QRectF(rect.left() + 46, rect.top() + 24, rect.width() - 58, 16),
+                              Qt.AlignLeft | Qt.AlignVCenter, "Error: " + ctrl.error_text)
+            return
+
+        progress_rect = QRectF(rect.left() + 46, rect.bottom() - 18, max(0, rect.width() - 132), 4)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#4a4a4a"))
+        painter.drawRoundedRect(progress_rect, 2, 2)
+        frac = ctrl.position_fraction()
+        painter.setBrush(QColor(self.settings.get("link", "#3794ff")))
+        painter.drawRoundedRect(QRectF(progress_rect.left(), progress_rect.top(),
+                                        progress_rect.width() * frac, progress_rect.height()), 2, 2)
+
+        painter.setPen(QColor("#bbbbbb"))
+        f3 = painter.font(); f3.setPointSize(7); painter.setFont(f3)
+        painter.drawText(QRectF(rect.right() - 82, rect.bottom() - 20, 78, 16),
+                          Qt.AlignRight | Qt.AlignVCenter, ctrl.time_text())
+
+    def insert_media_object(self, media_type, src, alt):
+        """Insert a new embedded media object at the cursor. `src` is kept
+        exactly as given (so relative paths and URLs round-trip through
+        Markdown unchanged); resolution to an actual loadable path/URL
+        happens on demand when painting."""
+        fmt = QTextCharFormat()
+        fmt.setObjectType(MEDIA_OBJECT_TYPE)
+        fmt.setProperty(MEDIA_TYPE_PROP, media_type)
+        fmt.setProperty(MEDIA_SRC_PROP, src)
+        fmt.setProperty(MEDIA_ALT_PROP, alt)
+        fmt.setProperty(MEDIA_ID_PROP, str(uuid.uuid4()))
+        cursor = self.textCursor()
+        cursor.insertText("\ufffc", fmt)
+        self.setTextCursor(cursor)
+
+    def replace_media_placeholders(self, media_matches):
+        """Called right after document().setMarkdown() replaces the whole
+        document: Qt's own Markdown importer already turned every
+        ![alt](src) into a plain static QTextImageFormat fragment (and
+        silently dropped the alt text - see media_matches, extracted from
+        the raw source beforehand). This walks those fragments and, for
+        every one whose src is a recognized image/gif/video/audio file,
+        swaps it for a real embedded media object (restoring the alt
+        text); anything else becomes an ordinary hyperlink instead, since
+        it isn't something this app can actually embed.
+        """
+        doc = self.document()
+        queue = list(media_matches)
+        replacements = []  # (start, end, media_type_or_None, src, alt)
+
+        block = doc.firstBlock()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid() and frag.charFormat().isImageFormat():
+                    src = frag.charFormat().toImageFormat().name()
+                    alt = queue.pop(0)[0] if queue else ""
+                    media_type = classify_media_path(src)
+                    replacements.append((frag.position(), frag.position() + frag.length(), media_type, src, alt))
+                it += 1
+            block = block.next()
+
+        for start, end, media_type, src, alt in reversed(replacements):
+            cursor = QTextCursor(doc)
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.KeepAnchor)
+            if media_type:
+                fmt = QTextCharFormat()
+                fmt.setObjectType(MEDIA_OBJECT_TYPE)
+                fmt.setProperty(MEDIA_TYPE_PROP, media_type)
+                fmt.setProperty(MEDIA_SRC_PROP, src)
+                fmt.setProperty(MEDIA_ALT_PROP, alt)
+                fmt.setProperty(MEDIA_ID_PROP, str(uuid.uuid4()))
+                cursor.insertText("\ufffc", fmt)
+            else:
+                fmt = QTextCharFormat()
+                fmt.setAnchor(True)
+                fmt.setAnchorHref(src)
+                fmt.setForeground(QColor(self.settings["link"]))
+                fmt.setFontUnderline(self.settings.get("link_underline", True))
+                cursor.insertText(alt if alt else src, fmt)
+
+    def release_media_players(self):
+        """Stop every live QMediaPlayer this editor owns, so closing a tab
+        doesn't leave audio/video quietly playing in the background."""
+        for ctrl in self._media_controllers.values():
+            ctrl.stop_and_release()
 
     def _find_char_run(self, click_pos, predicate):
         """Find the contiguous run of characters around click_pos for which
@@ -1403,6 +2384,8 @@ class Editor(QTextEdit):
         click_pos = self.cursorForPosition(event.pos()).position()
         cursor = self.cursorForPosition(event.pos())
         fmt = cursor.charFormat()
+
+        media_hit = self._media_object_at(event.pos())
         
         if not fmt.isAnchor():
             temp = QTextCursor(cursor)
@@ -1586,6 +2569,18 @@ class Editor(QTextEdit):
                 action = QAction(label, menu)
                 action.triggered.connect(handler)
                 menu.addAction(action)
+
+        if media_hit is not None:
+            media_fmt, _media_rect, media_obj_pos = media_hit
+            media_type = media_fmt.property(MEDIA_TYPE_PROP)
+            if media_type in ("image", "gif", "video"):
+                menu.addSeparator()
+
+                edit_link_action = QAction("Edit link…", menu)
+                edit_link_action.triggered.connect(
+                    lambda checked=False, e=self, p=media_obj_pos, f=QTextCharFormat(media_fmt):
+                        self.window().edit_media_from_menu(e, p, f))
+                menu.addAction(edit_link_action)
 
         menu.exec(event.globalPos())
 
@@ -2061,25 +3056,6 @@ class Editor(QTextEdit):
         row1_bg = QColor(self.settings["table_row1_bg"])
         row2_bg = QColor(self.settings["table_row2_bg"])
 
-        align_map = {
-            "left": Qt.AlignLeft,
-            "center": Qt.AlignHCenter,
-            "right": Qt.AlignRight,
-        }
-        # Alignment is per-table (set from Edit Table, not the app-wide
-        # Settings dialog). Fall back to the old global default for tables
-        # that don't have their own value yet (e.g. freshly opened files).
-        if table_fmt.hasProperty(TABLE_HEADER_ALIGN_PROP):
-            header_align_key = table_fmt.property(TABLE_HEADER_ALIGN_PROP)
-        else:
-            header_align_key = self.settings.get("table_header_align", "left")
-        if table_fmt.hasProperty(TABLE_ROW_ALIGN_PROP):
-            row_align_key = table_fmt.property(TABLE_ROW_ALIGN_PROP)
-        else:
-            row_align_key = self.settings.get("table_row_align", "left")
-        header_align = align_map.get(header_align_key, Qt.AlignLeft)
-        row_align = align_map.get(row_align_key, Qt.AlignLeft)
-
         for r in range(rows):
             for c in range(cols):
                 cell = table.cellAt(r, c)
@@ -2093,22 +3069,10 @@ class Editor(QTextEdit):
                     fmt.setForeground(QColor(self.settings['editor_text']))
                     fmt.setFontWeight(QFont.Normal)
                 cell.setFormat(fmt)
-
-                # Alignment lives on the paragraph(s) inside the cell, not
-                # on the cell's char format, so it has to be applied via a
-                # cursor over each block the cell contains (usually one,
-                # but a cell can hold several paragraphs).
-                align = header_align if r == 0 else row_align
-                it = cell.begin()
-                while not it.atEnd():
-                    blk = it.currentBlock()
-                    if blk.isValid():
-                        blk_cursor = QTextCursor(blk)
-                        blk_fmt = blk_cursor.blockFormat()
-                        if blk_fmt.alignment() != align:
-                            blk_fmt.setAlignment(align)
-                            blk_cursor.setBlockFormat(blk_fmt)
-                    it += 1
+                # Text alignment is left untouched here - it's real
+                # per-column Markdown alignment (see set_table_column_alignment()),
+                # already applied to each cell directly, not something this
+                # styling pass should override.
 
 
 class EditorTabs(QTabWidget):
@@ -2262,11 +3226,6 @@ class SettingsDialog(QDialog):
         self.add_color_picker(layout, "Row 1 (background)", "table_row1_bg")
         self.add_color_picker(layout, "Row 2 (background)", "table_row2_bg")
 
-        # Text alignment moved to the per-table "Edit Table" dialog (see
-        # MainWindow.open_table_editor()) so each table can set its own,
-        # instead of one alignment for every table in every document.
-        self.align_combos = {}
-
         layout.addRow(QLabel("--- Tab Colors ---"))
         self.add_color_picker(layout, "Active tab (background)", "tab_active_bg")
         self.add_color_picker(layout, "Inactive tab (background)", "tab_inactive_bg")
@@ -2312,17 +3271,6 @@ class SettingsDialog(QDialog):
             
         layout.addRow(label_text, row_widget)
 
-    def add_alignment_setting(self, layout, label_text, align_key):
-        combo = QComboBox()
-        combo.addItem("Left", "left")
-        combo.addItem("Center", "center")
-        combo.addItem("Right", "right")
-        current = self.settings.get(align_key, "left")
-        idx = combo.findData(current)
-        combo.setCurrentIndex(idx if idx >= 0 else 0)
-        layout.addRow(label_text, combo)
-        self.align_combos[align_key] = combo
-
     def pick_color(self, key, btn):
         color = QColorDialog.getColor(QColor(self.settings[key]))
         if color.isValid():
@@ -2343,8 +3291,6 @@ class SettingsDialog(QDialog):
         self.settings["link_underline"] = self.underline_check.isChecked()
         self.settings["quote_line_width"] = self.quote_line_width_spin.value()
         self.settings["hr_thickness"] = self.hr_thickness_spin.value()
-        for key, combo in self.align_combos.items():
-            self.settings[key] = combo.currentData()
         super().accept()
 
     def get_settings(self):
@@ -2390,26 +3336,43 @@ class PreferencesDialog(QDialog):
 
         layout.addRow("New line (character):", line_break_widget)
 
-        # Default table text alignment - applies to any table that hasn't
-        # been given its own alignment via that table's "Edit Table" dialog
-        # (see MainWindow.open_table_editor()), so this is the app-wide
-        # default while individual tables can still opt out and pick their
-        # own alignment locally.
-        self.align_combos = {}
+        # Default alignment every column of a newly inserted table starts
+        # with (Insert > Table). Purely a starting point for brand-new
+        # tables - once a table exists, its alignment is set per-column via
+        # Edit Table and lives in the table itself, not in this setting.
+        self.table_default_align_combo = QComboBox()
+        self.table_default_align_combo.addItem("Left", "left")
+        self.table_default_align_combo.addItem("Center", "center")
+        self.table_default_align_combo.addItem("Right", "right")
+        current_table_align = self.settings.get("table_default_align", "left")
+        idx = self.table_default_align_combo.findData(current_table_align)
+        self.table_default_align_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        layout.addRow("Default new table column alignment:", self.table_default_align_combo)
 
-        def make_align_combo(settings_key):
-            combo = QComboBox()
-            combo.addItem("Left", "left")
-            combo.addItem("Center", "center")
-            combo.addItem("Right", "right")
-            current = self.settings.get(settings_key, "left")
-            idx = combo.findData(current)
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
-            self.align_combos[settings_key] = combo
-            return combo
+        # Minimum display width (px) an embedded Image / GIF / Video is
+        # never rendered smaller than (height follows proportionally). 0
+        # means no minimum. See Editor.media_intrinsic_size /
+        # _min_media_width_for.
+        min_size_widget = QWidget()
+        min_size_layout = QFormLayout(min_size_widget)
+        min_size_layout.setContentsMargins(0, 0, 0, 0)
 
-        layout.addRow("Default first row alignment:", make_align_combo("table_header_align"))
-        layout.addRow("Default other rows alignment:", make_align_combo("table_row_align"))
+        self.media_min_width_spins = {}
+        media_min_size_rows = [
+            ("image", "Image:"),
+            ("gif", "GIF:"),
+            ("video", "Video:"),
+        ]
+        for media_key, row_label in media_min_size_rows:
+            spin = QSpinBox()
+            spin.setRange(0, 4000)
+            spin.setSuffix(" px")
+            spin.setSpecialValueText("No minimum")
+            spin.setValue(int(self.settings.get(f"media_min_width_{media_key}", 0)))
+            self.media_min_width_spins[media_key] = spin
+            min_size_layout.addRow(row_label, spin)
+
+        layout.addRow("Minimum media size:", min_size_widget)
 
         self.tabs.addTab(general_tab, "General")
 
@@ -2518,8 +3481,10 @@ class PreferencesDialog(QDialog):
                 self.settings["line_break_style"] = value
                 break
 
-        for key, combo in self.align_combos.items():
-            self.settings[key] = combo.currentData()
+        self.settings["table_default_align"] = self.table_default_align_combo.currentData()
+
+        for media_key, spin in self.media_min_width_spins.items():
+            self.settings[f"media_min_width_{media_key}"] = spin.value()
 
         selected_langs = [code for code, check in self.spell_lang_checks.items() if check.isChecked()]
         if selected_langs:
@@ -2566,8 +3531,21 @@ class LinkDialog(QDialog):
         self.url_input.setTextCursor(url_cursor)
         self.url_input.selectAll()
 
+        # Local files can be picked instead of typing/pasting a URL. The
+        # chosen path is stored as a file:// URI, which open_hyperlink()
+        # recognizes and launches via the system file explorer's default
+        # file association, instead of the web browser.
+        browse_btn = QPushButton("Choose local file…")
+        browse_btn.clicked.connect(self._browse_local_file)
+
+        url_row = QWidget()
+        url_row_layout = QVBoxLayout(url_row)
+        url_row_layout.setContentsMargins(0, 0, 0, 0)
+        url_row_layout.addWidget(self.url_input)
+        url_row_layout.addWidget(browse_btn)
+
         layout.addRow("Display text:", self.text_input)
-        layout.addRow("URL Address:", self.url_input)
+        layout.addRow("URL Address:", url_row)
 
         self._removed = False
 
@@ -2578,6 +3556,18 @@ class LinkDialog(QDialog):
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
         layout.addRow(btn_box)
+
+    def _browse_local_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose file")
+        if not path:
+            return
+        # Stored as a plain path (no file:// prefix) - this is what
+        # Markdown viewers/parsers actually expect for local-file links.
+        self.url_input.setPlainText(path)
+        # If no display text was entered yet, default it to the file name
+        # so the inserted link isn't left blank.
+        if not self.text_input.toPlainText().strip():
+            self.text_input.setPlainText(os.path.basename(path))
 
     def _on_remove(self):
         self._removed = True
@@ -2591,6 +3581,106 @@ class LinkDialog(QDialog):
         # comfortable editing of single-line values, not real multi-line
         # text, so a stray newline should never end up inside the anchor's
         # display text or href.
+        text = " ".join(self.text_input.toPlainText().splitlines()).strip()
+        url = " ".join(self.url_input.toPlainText().splitlines()).strip()
+        return text, url
+
+
+class MediaDialog(QDialog):
+    """Insert/edit an embedded media object - image, animated gif, video,
+    or audio. Deliberately mirrors LinkDialog (same two-field + "browse a
+    local file" layout) since the two dialogs do the same conceptual job;
+    which one applies is decided later, purely by the file extension of
+    whatever path/URL ends up here (see classify_media_path)."""
+
+    MEDIA_FILE_FILTER = (
+        "Multimedia (*.png *.jpg *.jpeg *.bmp *.webp *.svg *.ico *.tif *.tiff "
+        "*.gif *.mp4 *.avi *.mkv *.mov *.webm *.wmv *.m4v *.mpg *.mpeg "
+        "*.mp3 *.wav *.ogg *.flac *.m4a *.aac *.wma *.opus);;All files (*)"
+    )
+
+    def __init__(self, alt_text="", src="", parent=None, allow_remove=False):
+        super().__init__(parent)
+        self.setWindowTitle("Multimedia - MPad++")
+        self.setMinimumWidth(640)
+        self.setMinimumHeight(360)
+        self.resize(680, 400)
+        layout = QFormLayout(self)
+
+        info = QLabel(
+            "Supported: images, gifs, video and audio - as a local path,\n"
+            "a relative path (e.g. .\\image.png, resolved from the saved .md file)\n"
+            "or a URL. A player for video/audio is added automatically."
+        )
+        info.setWordWrap(True)
+        layout.addRow(info)
+
+        self.text_input = QPlainTextEdit(alt_text)
+        self.text_input.setTabChangesFocus(True)
+        self.text_input.setMinimumHeight(70)
+
+        self.url_input = QPlainTextEdit(src)
+        self.url_input.setTabChangesFocus(True)
+        self.url_input.setMinimumHeight(70)
+        url_cursor = self.url_input.textCursor()
+        url_cursor.movePosition(QTextCursor.Start)
+        self.url_input.setTextCursor(url_cursor)
+        self.url_input.selectAll()
+
+        browse_btn = QPushButton("Choose local file…")
+        browse_btn.clicked.connect(self._browse_local_file)
+
+        self.type_label = QLabel()
+        self._update_type_label()
+        self.url_input.textChanged.connect(self._update_type_label)
+
+        url_row = QWidget()
+        url_row_layout = QVBoxLayout(url_row)
+        url_row_layout.setContentsMargins(0, 0, 0, 0)
+        url_row_layout.addWidget(self.url_input)
+        url_row_layout.addWidget(browse_btn)
+        url_row_layout.addWidget(self.type_label)
+
+        layout.addRow("Alt text:", self.text_input)
+        layout.addRow("Path / URL:", url_row)
+
+        self._removed = False
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        if allow_remove:
+            remove_btn = btn_box.addButton("Remove", QDialogButtonBox.DestructiveRole)
+            remove_btn.clicked.connect(self._on_remove)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addRow(btn_box)
+
+    def _update_type_label(self):
+        src = " ".join(self.url_input.toPlainText().splitlines()).strip()
+        media_type = classify_media_path(src)
+        names = {"image": "image", "gif": "animated gif", "video": "video", "audio": "audio"}
+        if not src:
+            self.type_label.setText("")
+        elif media_type:
+            self.type_label.setText(f"Will be embedded as: {names[media_type]}")
+        else:
+            self.type_label.setText("Unrecognized extension - will be inserted as a plain link")
+
+    def _browse_local_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose multimedia file", "", self.MEDIA_FILE_FILTER)
+        if not path:
+            return
+        self.url_input.setPlainText(path)
+        if not self.text_input.toPlainText().strip():
+            self.text_input.setPlainText(os.path.basename(path))
+
+    def _on_remove(self):
+        self._removed = True
+        self.accept()
+
+    def is_removed(self):
+        return self._removed
+
+    def get_data(self):
         text = " ".join(self.text_input.toPlainText().splitlines()).strip()
         url = " ".join(self.url_input.toPlainText().splitlines()).strip()
         return text, url
@@ -3014,6 +4104,11 @@ class MainWindow(QMainWindow):
         self.act_link.triggered.connect(self.insert_link)
         toolbar.addAction(self.act_link)
 
+        self.act_media = QAction("", self)
+        self.act_media.setToolTip("Insert media (image / video / gif / audio)")
+        self.act_media.triggered.connect(self.insert_media)
+        toolbar.addAction(self.act_media)
+
         toolbar.addSeparator()
 
         self.act_spellcheck_toolbar = QAction("", self); self.act_spellcheck_toolbar.setCheckable(True)
@@ -3033,6 +4128,7 @@ class MainWindow(QMainWindow):
             "bold": self.act_bold, "italic": self.act_italic, "underline": self.act_underline,
             "code": self.act_code, "quote": self.act_quote, "ul": self.act_ul, "ol": self.act_ol,
             "table": self.act_table, "line": self.act_hr, "link": self.act_link,
+            "media": self.act_media,
             "spellcheck": self.act_spellcheck_toolbar,
         }
         self.refresh_toolbar_icons()
@@ -3110,6 +4206,8 @@ class MainWindow(QMainWindow):
         if editor and editor.document().isModified():
             reply = QMessageBox.question(self, "Close Tab", "The tab has unsaved changes. Are you sure you want to close it?", QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.No: return
+        if editor:
+            editor.release_media_players()
         self.tab_widget.removeTab(index)
         if self.tab_widget.count() == 0:
             self.new_tab()
@@ -3371,11 +4469,12 @@ class MainWindow(QMainWindow):
         for c in range(cols):
             cell = table.cellAt(0, c)
             cursor = cell.firstCursorPosition()
-            cursor.movePosition(QTextCursor.EndOfCell, QTextCursor.KeepAnchor)
+            cursor.setPosition(cell.lastCursorPosition().position(), QTextCursor.KeepAnchor)
             header.append(cursor.selectedText().replace('\n', ' '))
         md_lines.append("| " + " | ".join(header) + " |")
-        
-        sep = ["---"] * cols
+
+        sep_markers = {"left": "---", "center": ":---:", "right": "---:"}
+        sep = [sep_markers.get(get_table_column_alignment(table, c), "---") for c in range(cols)]
         md_lines.append("| " + " | ".join(sep) + " |")
         
         for r in range(1, rows):
@@ -3383,7 +4482,7 @@ class MainWindow(QMainWindow):
             for c in range(cols):
                 cell = table.cellAt(r, c)
                 cursor = cell.firstCursorPosition()
-                cursor.movePosition(QTextCursor.EndOfCell, QTextCursor.KeepAnchor)
+                cursor.setPosition(cell.lastCursorPosition().position(), QTextCursor.KeepAnchor)
                 row_data.append(cursor.selectedText().replace('\n', ' '))
             md_lines.append("| " + " | ".join(row_data) + " |")
 
@@ -3414,8 +4513,12 @@ class MainWindow(QMainWindow):
                 is_bold = fmt.fontWeight() == QFont.Bold
                 is_italic = fmt.fontItalic()
                 is_underline = fmt.fontUnderline()
-                
-                if is_code:
+
+                if fmt.objectType() == MEDIA_OBJECT_TYPE:
+                    alt = fmt.property(MEDIA_ALT_PROP) or ""
+                    src = fmt.property(MEDIA_SRC_PROP) or ""
+                    piece = f"![{self.escape_md_text(alt)}]({src})"
+                elif is_code:
                     piece = f"`{text}`"
                 elif is_anchor:
                     piece = f"[{self.escape_md_text(text)}]({fmt.anchorHref()})"
@@ -3657,8 +4760,10 @@ class MainWindow(QMainWindow):
             editor.document().setUndoRedoEnabled(False)
             editor.setExtraSelections([])
             editor.document().setMarkdown(content, QTextDocument.MarkdownDialectGitHub)
+            apply_markdown_table_alignments(editor.document(), parse_markdown_table_alignments(content))
             editor.current_file = file_path
             editor.view_mode = "formatted"
+            editor.replace_media_placeholders(extract_media_alt_map(content))
             editor.post_process_markdown()
             editor.style_tables()
             editor.apply_settings_to_document(restore_cursor=False)
@@ -3732,6 +4837,10 @@ class MainWindow(QMainWindow):
                     event.ignore()
                     return
                 break
+        for i in range(self.tab_widget.count()):
+            editor = self.tab_widget.widget(i)
+            if editor:
+                editor.release_media_players()
         self.spell_manager.shutdown()
         event.accept()
 
@@ -4078,6 +5187,11 @@ class MainWindow(QMainWindow):
                 [QTextLength(QTextLength.VariableLength, 0)] * cols
             )
             cursor.insertTable(rows, cols, fmt)
+            table = cursor.currentTable()
+            default_align = self.settings.get("table_default_align", "left")
+            if default_align != "left" and table:
+                for c in range(cols):
+                    set_table_column_alignment(table, c, default_align)
             editor.style_tables()
 
     def open_table_editor(self):
@@ -4096,7 +5210,13 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
         
         btn_add_row = QPushButton("Add row below cursor")
-        btn_add_row.clicked.connect(lambda: (table.insertRows(row + 1, 1), editor.style_tables()))
+        def add_row():
+            table.insertRows(row + 1, 1)
+            # New row's cells start with no explicit alignment - bring them
+            # in line with the rest of their column.
+            sync_table_column_alignments(table)
+            editor.style_tables()
+        btn_add_row.clicked.connect(add_row)
         layout.addWidget(btn_add_row)
         
         btn_del_row = QPushButton("Delete cursor row")
@@ -4107,49 +5227,47 @@ class MainWindow(QMainWindow):
         layout.addWidget(btn_del_row)
         
         btn_add_col = QPushButton("Add column to the right")
-        btn_add_col.clicked.connect(lambda: (table.insertColumns(col + 1, 1), editor.style_tables()))
+        btn_add_col.clicked.connect(lambda: (table.insertColumns(col + 1, 1), editor.style_tables(), refresh_align_combos()))
         layout.addWidget(btn_add_col)
         
         btn_del_col = QPushButton("Delete cursor column")
         def del_col():
             if table.columns() > 1: table.removeColumns(col, 1)
             editor.style_tables()
+            refresh_align_combos()
         btn_del_col.clicked.connect(del_col)
         layout.addWidget(btn_del_col)
 
-        # Text alignment - per-TABLE override (stored on this table's own
-        # format via TABLE_HEADER_ALIGN_PROP/TABLE_ROW_ALIGN_PROP). The
-        # app-wide default lives in Preferences > General and is what a
-        # table uses until this combo is changed for it specifically.
+        # Markdown only aligns a table by whole COLUMN (the ":---"/"---:"/
+        # ":---:" separator marker applies to every row of that column
+        # alike), so one alignment control per column - applied straight to
+        # that column's cells - is what the format actually supports, unlike
+        # the old separate "header row" / "other rows" settings.
         align_row = QWidget()
         align_form = QFormLayout(align_row)
         align_form.setContentsMargins(0, 0, 0, 0)
-
-        table_fmt = table.format()
-
-        def make_align_combo(prop, settings_key):
-            combo = QComboBox()
-            combo.addItem("Left", "left")
-            combo.addItem("Center", "center")
-            combo.addItem("Right", "right")
-            current = table_fmt.property(prop) if table_fmt.hasProperty(prop) \
-                else self.settings.get(settings_key, "left")
-            idx = combo.findData(current)
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
-
-            def on_change(_, prop=prop):
-                fmt = table.format()
-                fmt.setProperty(prop, combo.currentData())
-                table.setFormat(fmt)
-                editor.style_tables()
-            combo.currentIndexChanged.connect(on_change)
-            return combo
-
-        align_form.addRow("First row text alignment:",
-                           make_align_combo(TABLE_HEADER_ALIGN_PROP, "table_header_align"))
-        align_form.addRow("Other rows text alignment:",
-                           make_align_combo(TABLE_ROW_ALIGN_PROP, "table_row_align"))
         layout.addWidget(align_row)
+
+        def refresh_align_combos():
+            while align_form.rowCount():
+                align_form.removeRow(0)
+            for c in range(table.columns()):
+                combo = QComboBox()
+                combo.addItem("Left", "left")
+                combo.addItem("Center", "center")
+                combo.addItem("Right", "right")
+                current = get_table_column_alignment(table, c)
+                idx = combo.findData(current)
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+                combo.currentIndexChanged.connect(
+                    lambda _, col=c, cmb=combo: (
+                        set_table_column_alignment(table, col, cmb.currentData()),
+                        editor.style_tables(),
+                    )
+                )
+                align_form.addRow(f"Column {c + 1} alignment:", combo)
+
+        refresh_align_combos()
 
         btn_close = QPushButton("Close")
         btn_close.clicked.connect(dialog.accept)
@@ -4186,6 +5304,37 @@ class MainWindow(QMainWindow):
                 cursor.insertText(text, fmt)
                 editor.setTextCursor(cursor)
 
+    def insert_media(self):
+        editor = self.get_editor()
+        if not editor: return
+        cursor = editor.textCursor()
+        default_alt = cursor.selectedText() if cursor.hasSelection() else ""
+
+        dialog = MediaDialog(default_alt, "", self)
+        if dialog.exec() == QDialog.Accepted:
+            alt, src = dialog.get_data()
+            if not src:
+                return
+            if not alt:
+                alt = os.path.basename(src.split("?", 1)[0].split("#", 1)[0]) or "media"
+            media_type = classify_media_path(src)
+            if cursor.hasSelection():
+                cursor.removeSelectedText()
+                editor.setTextCursor(cursor)
+            if media_type:
+                editor.insert_media_object(media_type, src, alt)
+            else:
+                # Not a recognized image/gif/video/audio extension - falls
+                # back to a plain hyperlink instead of an embedded object.
+                fmt = QTextCharFormat()
+                fmt.setAnchor(True)
+                fmt.setAnchorHref(src)
+                fmt.setForeground(QColor(self.settings['link']))
+                fmt.setFontUnderline(self.settings.get("link_underline", True))
+                cursor = editor.textCursor()
+                cursor.insertText(alt, fmt)
+                editor.setTextCursor(cursor)
+
     def edit_link_from_menu(self, editor, cursor, old_text, old_url):
         # allow_remove=True adds a "Remove Link" button, so removing a
         # hyperlink no longer depends on fiddling with selections/toolbar
@@ -4212,6 +5361,58 @@ class MainWindow(QMainWindow):
         fmt.setAnchorHref("")
         fmt.setFontUnderline(False)
         cursor.mergeCharFormat(fmt)
+        editor.setTextCursor(cursor)
+
+    # --- Embedded media: "Settings" context-menu options ---
+
+    def _media_object_cursor(self, editor, obj_pos):
+        """Select exactly the one ObjectReplacementCharacter of the media
+        object at `obj_pos` (as returned by Editor._media_object_at)."""
+        last = editor.document().characterCount() - 1
+        cursor = QTextCursor(editor.document())
+        cursor.setPosition(obj_pos)
+        cursor.setPosition(min(obj_pos + 1, last), QTextCursor.KeepAnchor)
+        return cursor
+
+    def edit_media_from_menu(self, editor, obj_pos, fmt):
+        old_alt = fmt.property(MEDIA_ALT_PROP) or ""
+        old_src = fmt.property(MEDIA_SRC_PROP) or ""
+        dialog = MediaDialog(old_alt, old_src, self, allow_remove=True)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        cursor = self._media_object_cursor(editor, obj_pos)
+        if dialog.is_removed():
+            cursor.removeSelectedText()
+            editor.setTextCursor(cursor)
+            return
+        alt, src = dialog.get_data()
+        if not src:
+            return
+        if not alt:
+            alt = os.path.basename(src.split("?", 1)[0].split("#", 1)[0]) or "media"
+        media_type = classify_media_path(src)
+        if media_type:
+            new_fmt = QTextCharFormat()
+            new_fmt.setObjectType(MEDIA_OBJECT_TYPE)
+            new_fmt.setProperty(MEDIA_TYPE_PROP, media_type)
+            new_fmt.setProperty(MEDIA_SRC_PROP, src)
+            new_fmt.setProperty(MEDIA_ALT_PROP, alt)
+            # A changed source needs a fresh player/controller; an
+            # unchanged one keeps its id so playback isn't interrupted.
+            new_fmt.setProperty(MEDIA_ID_PROP, fmt.property(MEDIA_ID_PROP) if src == old_src else str(uuid.uuid4()))
+            new_fmt.setProperty(MEDIA_SCALE_PROP, fmt.property(MEDIA_SCALE_PROP) or 1.0)
+            cursor.removeSelectedText()
+            cursor.insertText("\ufffc", new_fmt)
+        else:
+            # Not a recognized image/gif/video/audio extension anymore -
+            # falls back to a plain hyperlink, same as insert_media().
+            link_fmt = QTextCharFormat()
+            link_fmt.setAnchor(True)
+            link_fmt.setAnchorHref(src)
+            link_fmt.setForeground(QColor(self.settings['link']))
+            link_fmt.setFontUnderline(self.settings.get("link_underline", True))
+            cursor.removeSelectedText()
+            cursor.insertText(alt, link_fmt)
         editor.setTextCursor(cursor)
 
     # --- Remove <format> from context menu (PPM > Remove Bold/Headline/etc.) ---
@@ -4435,7 +5636,7 @@ class MainWindow(QMainWindow):
         is_plain = bool(editor) and editor.view_mode == "plain"
         actions = [self.act_bold, self.act_italic, self.act_underline, self.act_code,
                    self.act_quote, self.act_ul, self.act_ol, self.act_table,
-                   self.act_hr, self.act_link] + list(self.h_actions.values())
+                   self.act_hr, self.act_link, self.act_media] + list(self.h_actions.values())
         for action in actions:
             action.setEnabled(not is_plain)
 
@@ -4455,56 +5656,73 @@ class MainWindow(QMainWindow):
         editor.document().setUndoRedoEnabled(False)
         editor.setExtraSelections([])
 
-        if mode == "plain":
-            # Show the exact markdown source that File > Save would write,
-            # in a flat, uncolored style - no rich formatting to keep in
-            # sync while the user edits raw syntax directly. This mirrors
-            # a plain text editor like Notepad++: what's on screen here
-            # is exactly what's on disk, syntax characters included.
-            md_text = self.export_markdown(editor)
-            editor.setPlainText(md_text)
+        try:
+            if mode == "plain":
+                # Show the exact markdown source that File > Save would write,
+                # in a flat, uncolored style - no rich formatting to keep in
+                # sync while the user edits raw syntax directly. This mirrors
+                # a plain text editor like Notepad++: what's on screen here
+                # is exactly what's on disk, syntax characters included.
+                md_text = self.export_markdown(editor)
+                editor.setPlainText(md_text)
 
-            flat_fmt = QTextCharFormat()
-            flat_fmt.setForeground(QColor(self.settings['editor_text']))
-            flat_fmt.setFontFamilies([self.settings['font_family']])
-            flat_fmt.setFontPointSize(self.settings['font_size'])
-            flat_fmt.setFontWeight(QFont.Normal)
-            flat_fmt.setFontItalic(False)
-            flat_fmt.setFontUnderline(False)
-            flat_fmt.setBackground(Qt.transparent)
-            # Custom properties (CODE_PROP here - the only char-level one;
-            # QUOTE_PROP/BLOCK_CODE_PROP/HR_PROP are block-level and are
-            # already gone since setPlainText() above rebuilds the blocks
-            # from scratch) aren't touched by properties simply left unset
-            # on flat_fmt, so it's spelled out explicitly rather than
-            # relying on it defaulting to "off".
-            flat_fmt.setProperty(CODE_PROP, False)
-            # Anchor state (link color/underline/href) is explicitly
-            # cleared too, for the same reason - otherwise leftover anchor
-            # formatting from whatever the editor's live cursor last had
-            # active can carry into the freshly-typed plain text.
-            flat_fmt.setAnchor(False)
-            flat_fmt.setAnchorHref("")
-            select_cursor = QTextCursor(editor.document())
-            select_cursor.select(QTextCursor.Document)
-            # setCharFormat() (not mergeCharFormat()) so this is a full
-            # replace: every character in Plain Text view ends up with
-            # exactly flat_fmt and nothing else, instead of flat_fmt
-            # merged on top of whatever format happened to still be
-            # active - the previous merge-based approach could leave
-            # invisible leftover formatting (most notably CODE_PROP)
-            # sitting on characters that looked plain on screen.
-            select_cursor.setCharFormat(flat_fmt)
-        else:
-            # Route back through the same normalization used for File >
-            # Open (currently: <br>/<br/> line-break-tag handling), so
-            # raw markdown typed or edited by hand in plain-text mode
-            # reads back the same way a saved-and-reopened file would.
-            text = self.preprocess_markdown(editor.toPlainText())
-            editor.document().setMarkdown(text, QTextDocument.MarkdownDialectGitHub)
-            editor.post_process_markdown()
-            editor.apply_settings_to_document(restore_cursor=False)
-            editor.style_tables()
+                flat_fmt = QTextCharFormat()
+                flat_fmt.setForeground(QColor(self.settings['editor_text']))
+                flat_fmt.setFontFamilies([self.settings['font_family']])
+                flat_fmt.setFontPointSize(self.settings['font_size'])
+                flat_fmt.setFontWeight(QFont.Normal)
+                flat_fmt.setFontItalic(False)
+                flat_fmt.setFontUnderline(False)
+                flat_fmt.setBackground(Qt.transparent)
+                # Custom properties (CODE_PROP here - the only char-level one;
+                # QUOTE_PROP/BLOCK_CODE_PROP/HR_PROP are block-level and are
+                # already gone since setPlainText() above rebuilds the blocks
+                # from scratch) aren't touched by properties simply left unset
+                # on flat_fmt, so it's spelled out explicitly rather than
+                # relying on it defaulting to "off".
+                flat_fmt.setProperty(CODE_PROP, False)
+                # Anchor state (link color/underline/href) is explicitly
+                # cleared too, for the same reason - otherwise leftover anchor
+                # formatting from whatever the editor's live cursor last had
+                # active can carry into the freshly-typed plain text.
+                flat_fmt.setAnchor(False)
+                flat_fmt.setAnchorHref("")
+                select_cursor = QTextCursor(editor.document())
+                select_cursor.select(QTextCursor.Document)
+                # setCharFormat() (not mergeCharFormat()) so this is a full
+                # replace: every character in Plain Text view ends up with
+                # exactly flat_fmt and nothing else, instead of flat_fmt
+                # merged on top of whatever format happened to still be
+                # active - the previous merge-based approach could leave
+                # invisible leftover formatting (most notably CODE_PROP)
+                # sitting on characters that looked plain on screen.
+                select_cursor.setCharFormat(flat_fmt)
+            else:
+                # Route back through the same normalization used for File >
+                # Open (currently: <br>/<br/> line-break-tag handling), so
+                # raw markdown typed or edited by hand in plain-text mode
+                # reads back the same way a saved-and-reopened file would.
+                text = self.preprocess_markdown(editor.toPlainText())
+                editor.document().setMarkdown(text, QTextDocument.MarkdownDialectGitHub)
+                apply_markdown_table_alignments(editor.document(), parse_markdown_table_alignments(text))
+                editor.replace_media_placeholders(extract_media_alt_map(text))
+                editor.post_process_markdown()
+                editor.apply_settings_to_document(restore_cursor=False)
+                editor.style_tables()
+        except Exception as e:
+            # A failure partway through must never leave the document stuck
+            # with undo/redo disabled, or the View menu's checkmark out of
+            # sync with editor.view_mode (which is only updated below, once
+            # the switch has actually succeeded) - both of which used to
+            # happen here and made the editor look "stuck" mid-switch.
+            editor.document().setUndoRedoEnabled(True)
+            editor.document().setModified(was_modified)
+            self.update_view_menu_state()
+            self.update_formatting_actions_enabled()
+            if had_focus:
+                editor.setFocus(Qt.OtherFocusReason)
+            QMessageBox.critical(self, "Error", f"Could not switch view:\n{e}")
+            return
 
         editor.view_mode = mode
 
@@ -4563,6 +5781,15 @@ class MainWindow(QMainWindow):
             # in-memory state (and reload/rehighlight) to match.
             self.spell_manager.set_custom_words(self.settings.get("spellcheck_custom_words", []))
             self.spell_manager.set_languages(self.settings.get("spellcheck_langs", ["pl_PL"]))
+            # Minimum media width may have changed - force every open
+            # document to relayout its embedded image/gif/video objects so
+            # the new minimum takes effect immediately, not just on next
+            # edit/reopen.
+            for i in range(self.tab_widget.count()):
+                editor = self.tab_widget.widget(i)
+                editor.settings = self.settings
+                editor.document().markContentsDirty(0, editor.document().characterCount())
+                editor.viewport().update()
 
             # Re-apply table styling in every open tab so a changed default
             # alignment shows immediately on tables that haven't been given
@@ -4599,4 +5826,4 @@ if __name__ == "__main__":
     if cli_files:
         window.open_files_from_args(cli_files)
 
-    sys.exit(app.exec())
+    sys.exit(app.exec())
