@@ -3,9 +3,9 @@ It's a notepad app supporting Markdown commands.
 
 <br>
 
-To be able to use Spell Check please install this package:
+To be able to use Spell Check please install these packages:
 ```
-pip install phunspell, PySide6-Addons
+pip install phunspell PySide6-Addons
 ```
 <img width="1920" height="1020" alt="image" src="https://github.com/user-attachments/assets/da20bdbe-80b5-4b86-93a5-f351cf32b47d" />
 
