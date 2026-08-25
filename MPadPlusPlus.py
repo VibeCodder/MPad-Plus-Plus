@@ -77,7 +77,23 @@ SPELLCHECK_LANGUAGES = [
 # contractions and hyphenated words ("don't", "wielko-formatowy")
 # aren't split into bogus fragments.
 LIST_BULLET_RE = re.compile(r'^(\s*)([•\-\*■])( +)(.*)$')
-LIST_NUMBERED_RE = re.compile(r'^(\s*)(\d+)\.( +)(.*)$')
+# Supports nested numbering like "2." (top level) or "2.1." / "2.1.3."
+# (nested under it) - one leading tab per nesting level, then a
+# dot-separated chain of numbers, a final dot, then the item's text. See
+# Editor.keyPressEvent()'s Tab/Shift+Tab handling for how a line moves
+# between levels and gets renumbered.
+LIST_NUMBERED_RE = re.compile(r'^(\t*)((?:\d+\.)*\d+)\.( +)(.*)$')
+
+def _parse_numbered_list_line(text):
+    """Returns (depth, numbers, spacing, content) for a numbered-list
+    line - depth is the nesting level (0 = top level), numbers is the
+    list of int components of its label (e.g. [2, 1] for "2.1."). Returns
+    None if the line isn't a numbered-list item at all."""
+    m = LIST_NUMBERED_RE.match(text)
+    if not m:
+        return None
+    indent, numbers_str, spacing, content = m.groups()
+    return len(indent), [int(p) for p in numbers_str.split('.')], spacing, content
 
 SPELLCHECK_WORD_RE = re.compile(r"[^\W\d_]+(?:['\u2019-][^\W\d_]+)*", re.UNICODE)
 # Matches a single "word" character - used to tell whether the cursor is
@@ -2844,6 +2860,86 @@ class Editor(QTextEdit):
             cursor.endEditBlock()
             self.setTextCursor(cursor)
 
+        if (event.key() in (Qt.Key_Tab, Qt.Key_Backtab)
+                and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier)):
+            cursor = self.textCursor()
+            if not cursor.hasSelection():
+                block = cursor.block()
+                line_text = block.text()
+                parsed = _parse_numbered_list_line(line_text)
+                if parsed is not None:
+                    depth, numbers, spacing, content = parsed
+                    block_start = block.position()
+                    orig_offset = cursor.position() - block_start
+                    old_prefix_len = len(line_text) - len(content)
+                    is_outdent = event.key() == Qt.Key_Backtab or bool(event.modifiers() & Qt.ShiftModifier)
+                    new_text = None
+                    if is_outdent:
+                        if depth == 0:
+                            # Nothing shallower than top level - Shift+Tab
+                            # here just drops the numbering instead of
+                            # doing nothing, the same way it would un-indent
+                            # a line with nowhere left to go.
+                            new_text = content
+                        else:
+                            # Becomes the next sibling of its former parent -
+                            # e.g. outdenting "2.1." (numbers=[2,1]) drops
+                            # the "1" and bumps the "2" to "3", matching
+                            # what continuing the ORIGINAL top-level list
+                            # after a nested block looks like.
+                            new_numbers = numbers[:-1]
+                            new_numbers[-1] += 1
+                            new_text = "\t" * (depth - 1) + '.'.join(map(str, new_numbers)) + '.' + spacing + content
+                    else:
+                        # Indent: only makes sense relative to the line
+                        # right above - you can't nest under nothing, and
+                        # (like every outliner) you can only go one level
+                        # deeper than what's immediately above, not skip
+                        # straight to a deeper level.
+                        prev_block = block.previous()
+                        prev_parsed = _parse_numbered_list_line(prev_block.text()) if prev_block.isValid() else None
+                        if prev_parsed is not None:
+                            prev_depth, prev_numbers, _, _ = prev_parsed
+                            if prev_depth == depth:
+                                # Nest under the item directly above, as its
+                                # first child - e.g. "3." right after "2."
+                                # becomes "2.1.".
+                                new_numbers = prev_numbers + [1]
+                            elif prev_depth == depth + 1:
+                                # Already at the target depth - become the
+                                # next sibling there instead of a child of
+                                # it (e.g. after "2.1." already exists,
+                                # indenting a new top-level line makes it
+                                # "2.2.", not "2.1.1.").
+                                new_numbers = prev_numbers[:-1] + [prev_numbers[-1] + 1]
+                            else:
+                                new_numbers = None
+                            if new_numbers is not None:
+                                new_depth = depth + 1
+                                new_text = "\t" * new_depth + '.'.join(map(str, new_numbers)) + '.' + spacing + content
+                    if new_text is not None:
+                        cursor.beginEditBlock()
+                        cursor.setPosition(block_start)
+                        cursor.setPosition(block_start + len(line_text), QTextCursor.KeepAnchor)
+                        cursor.removeSelectedText()
+                        cursor.insertText(new_text)
+                        cursor.endEditBlock()
+                        # Keep the caret at the same spot within the actual
+                        # text (not the marker) rather than always landing
+                        # at the end of the line.
+                        new_prefix_len = len(new_text) - len(content)
+                        if orig_offset >= old_prefix_len:
+                            new_offset = new_prefix_len + (orig_offset - old_prefix_len)
+                        else:
+                            new_offset = new_prefix_len
+                        restore_cursor = QTextCursor(self.document())
+                        restore_cursor.setPosition(block_start + new_offset)
+                        self.setTextCursor(restore_cursor)
+                    # Whether or not anything changed, a Tab/Backtab on a
+                    # recognized list line never falls through to inserting
+                    # a literal tab character.
+                    return
+
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             cursor = self.textCursor()
             block = cursor.block()
@@ -2963,8 +3059,35 @@ class Editor(QTextEdit):
                     m = bullet_match or numbered_match
                     indent, marker, spacing, content = m.groups()
                     if content.strip() == '':
-                        # Empty item - drop the marker and stay on this
-                        # (now blank) line instead of starting a new one.
+                        numbered_depth = len(indent) if numbered_match else 0
+                        if numbered_match and numbered_depth > 0:
+                            # Empty nested item - rather than dropping all
+                            # numbering at once, pop out one level and
+                            # continue THAT level's numbering instead (same
+                            # arithmetic as Shift+Tab - see its comment
+                            # above). Pressing Enter again on the resulting
+                            # (still-empty, now-shallower) item repeats
+                            # this, so it takes one Enter per nesting level
+                            # to fully back out, ending - once depth 0 is
+                            # reached - in the plain "drop the marker"
+                            # behavior below, same as a never-nested item.
+                            numbers = [int(p) for p in marker.split('.')]
+                            new_numbers = numbers[:-1]
+                            new_numbers[-1] += 1
+                            new_indent = "\t" * (numbered_depth - 1)
+                            new_line = f"{new_indent}{'.'.join(map(str, new_numbers))}.{spacing}"
+                            cursor.beginEditBlock()
+                            cursor.setPosition(block.position())
+                            cursor.setPosition(block.position() + len(line_text), QTextCursor.KeepAnchor)
+                            cursor.removeSelectedText()
+                            cursor.insertText(new_line)
+                            cursor.endEditBlock()
+                            self.setTextCursor(cursor)
+                            self.window().update_toolbar_state()
+                            return
+                        # Empty, top-level item - drop the marker and stay
+                        # on this (now blank) line instead of starting a
+                        # new one.
                         cursor.beginEditBlock()
                         cursor.setPosition(block.position())
                         cursor.setPosition(block.position() + len(line_text), QTextCursor.KeepAnchor)
@@ -2977,7 +3100,14 @@ class Editor(QTextEdit):
                         cursor.beginEditBlock()
                         cursor.insertBlock()
                         if numbered_match:
-                            new_marker = f"{int(marker) + 1}."
+                            # marker may now be a dotted chain like "2.1"
+                            # (see LIST_NUMBERED_RE) - only the last
+                            # component advances; a nested item's parent
+                            # number doesn't change just because a sibling
+                            # was added underneath it.
+                            parts = marker.split('.')
+                            parts[-1] = str(int(parts[-1]) + 1)
+                            new_marker = '.'.join(parts) + '.'
                         else:
                             new_marker = marker
                         cursor.insertText(f"{indent}{new_marker}{spacing}")
