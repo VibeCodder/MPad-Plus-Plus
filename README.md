@@ -1,4 +1,4 @@
-# MPad Plus Plus
+# MPad++
 It's a notepad app supporting Markdown commands.
 
 <br>
