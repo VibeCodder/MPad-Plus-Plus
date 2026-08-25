@@ -5,6 +5,7 @@ import re
 import uuid
 import webbrowser
 import urllib.request
+from collections import deque
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout, 
                                QHBoxLayout, QWidget, QToolBar, QDialog, 
                                QLabel, QLineEdit, QDialogButtonBox, QColorDialog, 
@@ -897,7 +898,18 @@ class SpellCheckManager(QObject):
         thread = _SuggestionLoaderThread(word, self.current_dictionaries(), limit, self)
         thread.ready.connect(lambda w, results, k=key: self._on_suggestions_ready(k, results))
         self._suggestion_threads.append(thread)
-        thread.start()
+        # LowPriority for the same reason _start_correctness_thread() uses
+        # it (see check_words_async's docstring): phunspell.suggest() is
+        # even more CPU-heavy than a lookup() - it computes edit distances
+        # against the whole dictionary - and a background QThread still
+        # shares the GIL with the GUI thread. Left at normal priority, a
+        # document/paste with many misspelled words at once (e.g. text in
+        # a language not in the active dictionary) queues up suggestion
+        # computation after suggestion computation, and those threads
+        # winning the GIL over the GUI thread is what showed up as
+        # freezing even though the work is technically "off" the GUI
+        # thread.
+        thread.start(QThread.LowPriority)
 
     def prefetch_suggestions(self, word, limit=6):
         """Warms the suggestion cache for `word` in the background without
@@ -972,6 +984,114 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
         self._debounce.timeout.connect(self._recheck_active_word)
         editor.cursorPositionChanged.connect(self._on_cursor_moved)
 
+        # --- Bulk-load mode (whole-document freeze avoidance) ---
+        # QSyntaxHighlighter has no supported way to move highlightBlock()
+        # off the GUI thread - it mutates the live QTextLayout formatting
+        # directly, so Qt always calls it synchronously, on the GUI thread,
+        # one block at a time. Everything above already keeps each
+        # individual highlightBlock() call cheap while *typing* (dictionary
+        # lookups run on a background QThread; only a plain dict-cache read
+        # happens synchronously). But a whole-document replace - opening a
+        # large file, or the Formatted<->Plain Text view toggle re-parsing
+        # the whole document via setMarkdown()/setPlainText() - makes Qt
+        # call highlightBlock() for EVERY block in the document, back to
+        # back, in one synchronous pass, before control ever returns to the
+        # event loop. On a long document that pass itself - thousands of
+        # regex scans plus per-word cache lookups, one block after another
+        # with no chance to paint or process input in between - is what
+        # shows up as the app freezing/stuttering ("zacina") specifically
+        # on large text, even though nothing in it is individually slow.
+        #
+        # begin_bulk_load()/end_bulk_load() bracket those whole-document
+        # replaces (see callers below). While bulk mode is on,
+        # highlightBlock() does nothing at all (see the top of that method)
+        # so Qt's forced synchronous pass over every block is reduced to a
+        # no-op and returns instantly. end_bulk_load() then does the real
+        # work itself, but spread out: a queue of every block number in the
+        # document, drained a small chunk at a time via chained
+        # QTimer.singleShot(0, ...) calls. Each chunk still runs on the GUI
+        # thread (it has to), but returning to the event loop between
+        # chunks lets Qt paint and handle input in between, so the document
+        # visibly appears instantly and spelling underlines fill in over
+        # the next moment instead of the whole app locking up.
+        self._bulk_loading = False
+        self._bulk_queue = deque()
+        self._bulk_chunk_size = 40
+        # True for the duration of each chunk drained by _process_bulk_chunk
+        # (i.e. while highlightBlock() is running as part of the initial,
+        # automatic pass over a freshly-opened/pasted document - not while
+        # the user is actually looking at/editing a block). See
+        # highlightBlock()'s use of this below: a document can easily
+        # contain far more distinct misspelled words at once than a user
+        # editing normally ever would (e.g. text in a language other than
+        # the active dictionary, like this file's Lorem Ipsum test case),
+        # and eagerly prefetching suggestions - a CPU-heavy edit-distance
+        # search per word - for every single one of them during that
+        # automatic pass is wasted work for words nobody has clicked on
+        # yet, and was still enough queued background work (even at
+        # LowPriority, even bounded to 2-at-a-time) to make the GUI thread
+        # stutter. Suggestions are still computed on demand the moment the
+        # user actually right-clicks a misspelled word (see
+        # Editor._replace_spelling's caller), just not proactively for
+        # words still off-screen or never interacted with.
+        self._bulk_chunk_active = False
+        self._bulk_generation = 0   # bumped on each begin/end so a stale
+                                     # chained singleShot from a previous
+                                     # bulk pass (e.g. tab closed/reopened
+                                     # mid-pass) recognizes itself as stale
+                                     # and stops instead of processing a
+                                     # document it no longer applies to.
+
+    def begin_bulk_load(self):
+        """Call right before replacing the whole document (setMarkdown(),
+        setPlainText()) so the forced synchronous highlightBlock() pass
+        Qt is about to run over every block is a no-op instead of a
+        freeze. Always pair with end_bulk_load() once the replace is
+        done - use try/finally if anything between them could raise."""
+        self._bulk_loading = True
+        self._bulk_generation += 1
+        self._bulk_queue.clear()
+        self._pending_recheck_block = None
+        self._pending_recheck_whole_block = False
+        self._debounce.stop()
+
+    def end_bulk_load(self):
+        """Call right after the whole-document replace finishes. Queues
+        every block in the new document and starts draining it in small
+        chunks, off the immediate call stack, so real highlighting/spell
+        checking fills in progressively without blocking the GUI thread
+        for the whole document at once."""
+        self._bulk_loading = False
+        window = self.editor.window()
+        manager = getattr(window, "spell_manager", None)
+        if manager is None or not manager.enabled:
+            return  # nothing to highlight - skip scheduling entirely
+        doc = self.document()
+        self._bulk_queue = deque(range(doc.blockCount()))
+        generation = self._bulk_generation
+        QTimer.singleShot(0, lambda g=generation: self._process_bulk_chunk(g))
+
+    def _process_bulk_chunk(self, generation):
+        # A newer begin_bulk_load()/end_bulk_load() pair (or the editor/
+        # highlighter being torn down) has superseded this chain - drop it
+        # rather than process a queue that's no longer current.
+        if generation != self._bulk_generation or self._bulk_loading:
+            return
+        doc = self.document()
+        processed = 0
+        self._bulk_chunk_active = True
+        try:
+            while self._bulk_queue and processed < self._bulk_chunk_size:
+                block_num = self._bulk_queue.popleft()
+                block = doc.findBlockByNumber(block_num)
+                if block.isValid():
+                    self.rehighlightBlock(block)
+                processed += 1
+        finally:
+            self._bulk_chunk_active = False
+        if self._bulk_queue:
+            QTimer.singleShot(0, lambda g=generation: self._process_bulk_chunk(g))
+
     def _on_cursor_moved(self):
         # This fires on EVERY cursor-position change - including the one
         # caused by simply typing the next letter of the same word, since
@@ -1025,6 +1145,14 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
                 self._skip_active_word = True
 
     def highlightBlock(self, text):
+        if self._bulk_loading:
+            # See begin_bulk_load(): a whole-document replace is in
+            # progress and Qt is about to force a synchronous call here
+            # for every block. Doing nothing keeps that forced pass
+            # effectively free; end_bulk_load() re-processes every block
+            # for real afterwards, spread across chunks.
+            return
+
         window = self.editor.window()
         manager = getattr(window, "spell_manager", None)
         if manager is None or not manager.enabled:
@@ -1094,14 +1222,58 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
                 self.setFormat(match.start(), len(word), self._format)
                 # Warm the suggestion cache now, while the word is being
                 # underlined, instead of waiting for a right-click - see
-                # SpellCheckManager.prefetch_suggestions().
-                manager.prefetch_suggestions(word)
+                # SpellCheckManager.prefetch_suggestions(). Skipped during
+                # the automatic bulk pass over a freshly-opened/pasted
+                # document (see self._bulk_chunk_active's docstring) - a
+                # document can have far more misspelled words at once than
+                # a user ever has on screen while actually editing, and
+                # eagerly computing suggestions for all of them at once is
+                # exactly the queued-up CPU work that was still enough to
+                # stutter the GUI thread even off it. Right-clicking a
+                # misspelled word still computes its suggestions on demand
+                # regardless of whether this ran for it.
+                if not self._bulk_chunk_active:
+                    manager.prefetch_suggestions(word)
 
         if pending_words:
-            manager.check_words_async(pending_words, on_done=lambda b=block: self._on_words_checked(b))
+            # Remember whether THIS pass (the one collecting pending_words
+            # right now) is part of the automatic bulk pass over a
+            # freshly-opened/pasted document (_bulk_chunk_active - see its
+            # docstring above _process_bulk_chunk()). check_words_async()
+            # answers on a background thread, so its on_done callback below
+            # always fires LATER, on its own trip through the event loop -
+            # by then _process_bulk_chunk() has already returned and
+            # _bulk_chunk_active is back to False, even though the word
+            # being flagged only exists because of that bulk pass. Without
+            # capturing the flag here and passing it through, every
+            # misspelled word discovered this way would still (correctly)
+            # skip prefetching suggestions on THIS call, but then trigger a
+            # SECOND highlightBlock() pass via _on_words_checked() below
+            # that no longer looks like bulk loading - so it prefetches
+            # suggestions after all. On a document with many misspelled
+            # words at once (e.g. text in a language outside the active
+            # dictionary, like the Lorem Ipsum test file), that reintroduces
+            # the exact same flood of CPU-heavy edit-distance searches this
+            # whole mechanism was built to avoid, just one event-loop tick
+            # later - which is why the freeze only showed up AFTER the
+            # underlines had already started appearing.
+            bulk = self._bulk_chunk_active
+            manager.check_words_async(pending_words, on_done=lambda b=block, bulk=bulk: self._on_words_checked(b, bulk))
 
-    def _on_words_checked(self, block):
-        if block.isValid():
+    def _on_words_checked(self, block, suppress_prefetch=False):
+        if not block.isValid():
+            return
+        if suppress_prefetch:
+            # Re-enter with the same flag highlightBlock() uses to skip
+            # prefetch_suggestions() (see above) so this deferred,
+            # bulk-originated pass stays exempt too, instead of only the
+            # first, immediate pass being exempt.
+            self._bulk_chunk_active = True
+            try:
+                self.rehighlightBlock(block)
+            finally:
+                self._bulk_chunk_active = False
+        else:
             self.rehighlightBlock(block)
 
 
@@ -2749,7 +2921,34 @@ class Editor(QTextEdit):
                     QTimer.singleShot(0, lambda fp=file_path: self.window().open_file_path(fp, target_editor=self))
                     return
         super().dropEvent(event)
-        
+
+    def insertFromMimeData(self, source):
+        """Handles Ctrl+V paste and drag-and-drop of plain text/rich text
+        (file drops are handled separately by dropEvent above).
+
+        For a large paste, Qt inserts the whole thing as one edit, which -
+        exactly like setMarkdown()/setPlainText() during File > Open or the
+        view-mode toggle - forces QSyntaxHighlighter to synchronously call
+        highlightBlock() for every newly-inserted block in one go, before
+        control returns to the event loop. That single synchronous pass is
+        what shows up as the app freezing/stuttering right after pasting a
+        large amount of text, even though spell checking is otherwise kept
+        off the GUI thread everywhere else (see begin_bulk_load()'s
+        docstring). Wrapping the paste the same way File > Open does -
+        bulk mode off during the insert, real highlighting done afterwards
+        in small non-blocking chunks - fixes that without touching what
+        gets pasted or how.
+
+        Small pastes (typing-speed clipboard use) are wrapped too since the
+        cost of doing so is negligible - end_bulk_load() only spreads work
+        across ticks when there's actually more than one chunk's worth of
+        blocks to process."""
+        self.spell_highlighter.begin_bulk_load()
+        try:
+            super().insertFromMimeData(source)
+        finally:
+            self.spell_highlighter.end_bulk_load()
+
     def post_process_markdown(self):
         cursor = QTextCursor(self.document())
         cursor.beginEditBlock()
@@ -4759,15 +4958,19 @@ class MainWindow(QMainWindow):
 
             editor.document().setUndoRedoEnabled(False)
             editor.setExtraSelections([])
-            editor.document().setMarkdown(content, QTextDocument.MarkdownDialectGitHub)
-            apply_markdown_table_alignments(editor.document(), parse_markdown_table_alignments(content))
-            editor.current_file = file_path
-            editor.view_mode = "formatted"
-            editor.replace_media_placeholders(extract_media_alt_map(content))
-            editor.post_process_markdown()
-            editor.style_tables()
-            editor.apply_settings_to_document(restore_cursor=False)
-            editor.document().setModified(False)
+            editor.spell_highlighter.begin_bulk_load()
+            try:
+                editor.document().setMarkdown(content, QTextDocument.MarkdownDialectGitHub)
+                apply_markdown_table_alignments(editor.document(), parse_markdown_table_alignments(content))
+                editor.current_file = file_path
+                editor.view_mode = "formatted"
+                editor.replace_media_placeholders(extract_media_alt_map(content))
+                editor.post_process_markdown()
+                editor.style_tables()
+                editor.apply_settings_to_document(restore_cursor=False)
+                editor.document().setModified(False)
+            finally:
+                editor.spell_highlighter.end_bulk_load()
 
             # Move cursor to Start BEFORE re-enabling undo so that
             # setUndoRedoEnabled(True) cannot fire cursorPositionChanged
@@ -5656,6 +5859,14 @@ class MainWindow(QMainWindow):
         editor.document().setUndoRedoEnabled(False)
         editor.setExtraSelections([])
 
+        # Both branches below replace the whole document's content/formatting
+        # at once, which would otherwise force QSyntaxHighlighter to
+        # synchronously re-scan every block in one go - see
+        # SpellCheckHighlighter.begin_bulk_load() for why that freezes the
+        # app on a large document. end_bulk_load() (in both the success and
+        # error paths below) hands the real highlighting back off to be done
+        # in small, non-blocking chunks.
+        editor.spell_highlighter.begin_bulk_load()
         try:
             if mode == "plain":
                 # Show the exact markdown source that File > Save would write,
@@ -5710,6 +5921,7 @@ class MainWindow(QMainWindow):
                 editor.apply_settings_to_document(restore_cursor=False)
                 editor.style_tables()
         except Exception as e:
+            editor.spell_highlighter.end_bulk_load()
             # A failure partway through must never leave the document stuck
             # with undo/redo disabled, or the View menu's checkmark out of
             # sync with editor.view_mode (which is only updated below, once
@@ -5723,6 +5935,8 @@ class MainWindow(QMainWindow):
                 editor.setFocus(Qt.OtherFocusReason)
             QMessageBox.critical(self, "Error", f"Could not switch view:\n{e}")
             return
+        else:
+            editor.spell_highlighter.end_bulk_load()
 
         editor.view_mode = mode
 
