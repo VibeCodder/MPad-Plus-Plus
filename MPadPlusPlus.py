@@ -76,6 +76,9 @@ SPELLCHECK_LANGUAGES = [
 # optionally joined by a single internal apostrophe or hyphen so
 # contractions and hyphenated words ("don't", "wielko-formatowy")
 # aren't split into bogus fragments.
+LIST_BULLET_RE = re.compile(r'^(\s*)([•\-\*■])( +)(.*)$')
+LIST_NUMBERED_RE = re.compile(r'^(\s*)(\d+)\.( +)(.*)$')
+
 SPELLCHECK_WORD_RE = re.compile(r"[^\W\d_]+(?:['\u2019-][^\W\d_]+)*", re.UNICODE)
 # Matches a single "word" character - used to tell whether the cursor is
 # still sitting inside/next to a word (still typing it) versus having
@@ -624,6 +627,12 @@ class SpellCheckManager(QObject):
         self._correctness_threads = []
         self._correctness_queue = []   # (words, lang_key, on_done) batches waiting for a free slot
         self._max_concurrent_correctness_threads = 1
+        # See check_words_async(): caps how many words go into a single
+        # background lookup batch, so one huge block (e.g. a document
+        # with no blank-line paragraph breaks, which becomes one giant
+        # QTextBlock) can't turn into one multi-second, all-or-nothing
+        # background run before anything on screen updates.
+        self._CORRECTNESS_CHUNK_WORDS = 150
 
     def _invalidate_correctness_cache(self):
         self._correctness_cache.clear()
@@ -807,10 +816,28 @@ class SpellCheckManager(QObject):
         if not to_check:
             return
         self._correctness_threads = [t for t in self._correctness_threads if t.isRunning()]
-        if len(self._correctness_threads) >= self._max_concurrent_correctness_threads:
-            self._correctness_queue.append((to_check, lang_key, on_done))
-            return
-        self._start_correctness_thread(to_check, dictionaries, lang_key, on_done)
+        # A single call here can carry way more than a typical few-word
+        # edit's worth of lookups - e.g. the very first check of a large
+        # block that has no blank-line paragraph breaks (so the whole
+        # document loads as ONE QTextBlock) hands over every word in the
+        # entire document at once. Sending that as one lookup batch means
+        # on_done - and therefore the highlighter's re-formatting of that
+        # block - doesn't fire until every single word has been checked,
+        # so nothing updates for however long the full batch takes, and
+        # then everything appears at once. Slicing it into smaller pieces
+        # queues several smaller batches instead (reusing the existing
+        # one-thread-at-a-time queue below), so each piece's completion
+        # triggers its own on_done - results, and underlines, start
+        # trickling in well before the whole word list is done, and the
+        # GUI gets a trip back through the event loop between pieces
+        # instead of one long uninterrupted background run.
+        chunk_size = self._CORRECTNESS_CHUNK_WORDS
+        chunks = [to_check[i:i + chunk_size] for i in range(0, len(to_check), chunk_size)] or [to_check]
+        for chunk in chunks:
+            if len(self._correctness_threads) >= self._max_concurrent_correctness_threads:
+                self._correctness_queue.append((chunk, lang_key, on_done))
+                continue
+            self._start_correctness_thread(chunk, dictionaries, lang_key, on_done)
 
     def _start_correctness_thread(self, to_check, dictionaries, lang_key, on_done):
         thread = _CorrectnessCheckThread(to_check, dictionaries, self)
@@ -1174,7 +1201,28 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
             self._debounce.stop()
 
         cursor = self.editor.textCursor()
-        cursor_in_this_block = self._skip_active_word and cursor.block().blockNumber() == block.blockNumber()
+        # The "cursor is sitting in this block, so treat it as actively
+        # being typed in and defer" heuristic below only makes sense for
+        # real, live editing. During an automatic bulk pass over a
+        # freshly-opened/pasted document (_bulk_chunk_active - see its
+        # docstring), the cursor is just wherever it defaults to (usually
+        # position 0) - not evidence of typing - and if that position
+        # happens to land in a large block (e.g. a document with no
+        # blank-line paragraph breaks loads as ONE giant block, so the
+        # cursor is *always* "inside" it), every one of this pass's
+        # highlightBlock() calls, including the ones triggered later by
+        # each background correctness batch finishing (see
+        # _on_words_checked(), which re-enables this same flag for that
+        # reason), would otherwise get deferred behind the 300ms debounce
+        # below instead of running right away. With many batches that
+        # adds up to several seconds of the load looking "stuck" before
+        # anything reflects on screen, well after the actual dictionary
+        # lookups themselves are done.
+        cursor_in_this_block = (
+            not self._bulk_chunk_active
+            and self._skip_active_word
+            and cursor.block().blockNumber() == block.blockNumber()
+        )
         cursor_pos_in_block = cursor.position() - block.position() if cursor_in_this_block else -1
 
         if cursor_in_this_block and len(text) > SPELLCHECK_LARGE_BLOCK_CHARS:
@@ -2895,6 +2943,48 @@ class Editor(QTextEdit):
                     self.window().update_toolbar_state()
                     return
 
+            else:
+                # Lists here aren't real Qt QTextList objects - toggle_list()
+                # and post_process_markdown() both bake the marker ("• ",
+                # "■ " or "1. ") directly into the paragraph's plain text
+                # instead (see toggle_list()'s docstring-equivalent comment
+                # there). That means, unlike quote/code above, there's no
+                # block-level property to detect a list item by - it has to
+                # be read back out of the block's own text with a regex.
+                # Same continue/exit convention as quote and code blocks:
+                # Enter on a non-empty item carries the marker (incrementing
+                # the number for ordered lists) onto the new line; Enter on
+                # an already-empty item (just the marker, nothing typed
+                # after it) exits the list instead of adding another one.
+                line_text = block.text()
+                bullet_match = LIST_BULLET_RE.match(line_text)
+                numbered_match = None if bullet_match else LIST_NUMBERED_RE.match(line_text)
+                if bullet_match or numbered_match:
+                    m = bullet_match or numbered_match
+                    indent, marker, spacing, content = m.groups()
+                    if content.strip() == '':
+                        # Empty item - drop the marker and stay on this
+                        # (now blank) line instead of starting a new one.
+                        cursor.beginEditBlock()
+                        cursor.setPosition(block.position())
+                        cursor.setPosition(block.position() + len(line_text), QTextCursor.KeepAnchor)
+                        cursor.removeSelectedText()
+                        cursor.endEditBlock()
+                        self.setTextCursor(cursor)
+                        self.window().update_toolbar_state()
+                        return
+                    else:
+                        cursor.beginEditBlock()
+                        cursor.insertBlock()
+                        if numbered_match:
+                            new_marker = f"{int(marker) + 1}."
+                        else:
+                            new_marker = marker
+                        cursor.insertText(f"{indent}{new_marker}{spacing}")
+                        cursor.endEditBlock()
+                        self.setTextCursor(cursor)
+                        return
+
         super().keyPressEvent(event)
 
     def dropEvent(self, event: QDropEvent):
@@ -4092,7 +4182,16 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
         layout.addWidget(self.tab_widget)
         self.setCentralWidget(container)
-        
+
+        # Footer/status bar: word & character counts for the active tab
+        # plus the cursor's current line/column, refreshed on every edit
+        # and every cursor move. QStatusBar was already themed above (see
+        # apply_app_theme()) even though nothing had actually created one
+        # yet.
+        self.status_label = QLabel()
+        self.statusBar().addPermanentWidget(self.status_label)
+        self.update_status_bar()
+
         self.find_dialog = None
 
         self.create_menu()
@@ -4391,9 +4490,34 @@ class MainWindow(QMainWindow):
         self.tab_widget.add_close_button(editor)
         editor.selectionChanged.connect(self.update_toolbar_state)
         editor.document().modificationChanged.connect(lambda mod, e=editor: self.on_modification_changed(e))
+        editor.textChanged.connect(self.update_status_bar)
+        editor.cursorPositionChanged.connect(self.update_status_bar)
         if switch:
             self.tab_widget.setCurrentIndex(index)
+        self.update_status_bar()
         return editor
+
+    def update_status_bar(self):
+        """Refreshes the footer with the active tab's word/character
+        counts and the cursor's current line/column. Hooked up to every
+        editor's textChanged/cursorPositionChanged (in new_tab()) and to
+        tab switching (in on_tab_changed()) so it always reflects
+        whichever tab is currently showing, not just the one it was last
+        connected for."""
+        editor = self.get_editor()
+        if not editor:
+            self.status_label.setText("")
+            return
+        text = editor.toPlainText()
+        char_count = len(text)
+        word_count = len(text.split())
+        cursor = editor.textCursor()
+        line = cursor.blockNumber() + 1
+        col = cursor.positionInBlock() + 1
+        self.status_label.setText(
+            f"Words: {word_count}    Characters: {char_count}    Ln {line}, Col {col}"
+        )
+        self.status_label.setStyleSheet("color: #ccc; padding-right: 6px;")
 
     def on_modification_changed(self, editor):
         self.update_tab_title(editor)
@@ -4442,6 +4566,7 @@ class MainWindow(QMainWindow):
             self.update_window_title()
             self.update_toolbar_state()
             self.update_view_menu_state()
+        self.update_status_bar()
 
     def update_tab_title(self, editor):
         idx = self.tab_widget.indexOf(editor)
