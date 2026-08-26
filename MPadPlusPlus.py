@@ -2881,7 +2881,7 @@ class Editor(QTextEdit):
                             # doing nothing, the same way it would un-indent
                             # a line with nowhere left to go.
                             new_text = content
-                        else:
+                        elif len(numbers) > 1:
                             # Becomes the next sibling of its former parent -
                             # e.g. outdenting "2.1." (numbers=[2,1]) drops
                             # the "1" and bumps the "2" to "3", matching
@@ -2890,6 +2890,14 @@ class Editor(QTextEdit):
                             new_numbers = numbers[:-1]
                             new_numbers[-1] += 1
                             new_text = "\t" * (depth - 1) + '.'.join(map(str, new_numbers)) + '.' + spacing + content
+                        else:
+                            # Only one number component even though the line
+                            # is indented (e.g. pasted text, or a hand-edited/
+                            # hand-tabbed line) - there's no parent number to
+                            # bump, so just drop one indent level instead of
+                            # indexing into an empty list (which used to
+                            # crash here).
+                            new_text = "\t" * (depth - 1) + '.'.join(map(str, numbers)) + '.' + spacing + content
                     else:
                         # Indent: only makes sense relative to the line
                         # right above - you can't nest under nothing, and
@@ -3072,10 +3080,19 @@ class Editor(QTextEdit):
                             # reached - in the plain "drop the marker"
                             # behavior below, same as a never-nested item.
                             numbers = [int(p) for p in marker.split('.')]
-                            new_numbers = numbers[:-1]
-                            new_numbers[-1] += 1
                             new_indent = "\t" * (numbered_depth - 1)
-                            new_line = f"{new_indent}{'.'.join(map(str, new_numbers))}.{spacing}"
+                            if len(numbers) > 1:
+                                new_numbers = numbers[:-1]
+                                new_numbers[-1] += 1
+                                new_line = f"{new_indent}{'.'.join(map(str, new_numbers))}.{spacing}"
+                            else:
+                                # Only one number component even though the
+                                # line is indented (e.g. pasted text, or a
+                                # hand-edited/hand-tabbed line) - there's no
+                                # parent number to bump, so just drop one
+                                # indent level instead of indexing into an
+                                # empty list (which used to crash here).
+                                new_line = f"{new_indent}{'.'.join(map(str, numbers))}.{spacing}"
                             cursor.beginEditBlock()
                             cursor.setPosition(block.position())
                             cursor.setPosition(block.position() + len(line_text), QTextCursor.KeepAnchor)
@@ -3173,6 +3190,21 @@ class Editor(QTextEdit):
         cursor = QTextCursor(self.document())
         cursor.beginEditBlock()
         
+        # Running per-depth counters used to rebuild OUR OWN nested-numbered-
+        # list convention ("\t"*depth + "2.1." + " " + content, see
+        # LIST_NUMBERED_RE) out of Qt's real QTextList objects below. This
+        # can't just read Qt's own text_list.itemNumber(block): items are
+        # converted to plain text and removed from their QTextList one at a
+        # time in this same loop, and remove() re-indexes every remaining
+        # item in that list immediately - so itemNumber() queried *after* an
+        # earlier sibling has already been removed comes back wrong (every
+        # item ends up reporting position 0, i.e. "1."). Tracking our own
+        # depth-keyed counters, incremented/truncated as blocks are walked in
+        # document order, sidesteps that entirely and also reconstructs the
+        # indentation nested items need but Qt's flat itemNumber() can't
+        # express on its own.
+        list_counters = []
+        
         block = self.document().firstBlock()
         while block.isValid():
             next_block = block.next()
@@ -3218,19 +3250,33 @@ class Editor(QTextEdit):
                 fmt = text_list.format()
                 style = fmt.style()
                 prefix = ""
-                if style == QTextListFormat.Style.ListDisc or style == QTextListFormat.Style.ListCircle:
-                    prefix = "• "
-                elif style == QTextListFormat.Style.ListSquare:
-                    prefix = "■ "
-                elif style == QTextListFormat.Style.ListDecimal:
-                    idx = text_list.itemNumber(block) + 1
-                    prefix = f"{idx}. "
+                if style == QTextListFormat.Style.ListDecimal:
+                    # depth 0 = top level, matching LIST_NUMBERED_RE's one-
+                    # tab-per-level convention; Qt reports indent=1 for a
+                    # top-level list.
+                    depth = max(fmt.indent() - 1, 0)
+                    if depth >= len(list_counters):
+                        list_counters.extend([0] * (depth - len(list_counters) + 1))
+                    else:
+                        del list_counters[depth + 1:]
+                    list_counters[depth] += 1
+                    numbers = list_counters[:depth + 1]
+                    prefix = "\t" * depth + '.'.join(map(str, numbers)) + '. '
                 else:
-                    prefix = "• "
+                    list_counters = []
+                    if style == QTextListFormat.Style.ListSquare:
+                        prefix = "■ "
+                    else:
+                        prefix = "• "
                     
                 text_list.remove(block)
                 temp_cursor.insertText(prefix)
                 is_list = False
+            else:
+                # A non-list block breaks the run - the next numbered list
+                # (if any) starts fresh at "1." rather than continuing this
+                # one's counters.
+                list_counters = []
                 
             block_fmt = block.blockFormat()
             
@@ -5548,11 +5594,13 @@ class MainWindow(QMainWindow):
         
         start = cursor.selectionStart()
         end = cursor.selectionEnd()
+        doc = editor.document()
         
-        cursor.setPosition(start)
-        cursor.movePosition(QTextCursor.StartOfLine)
+        start_block = doc.findBlock(start)
+        end_block = doc.findBlock(end)
+        end_block_number = end_block.blockNumber()
         
-        line_text = cursor.block().text().strip()
+        line_text = start_block.text().strip()
         toggle_off = False
         
         is_ul = line_text.startswith("• ") or line_text.startswith("- ") or line_text.startswith("* ")
@@ -5562,33 +5610,48 @@ class MainWindow(QMainWindow):
             if is_ul: toggle_off = True
         else:
             if is_ol: toggle_off = True
-                
+        
+        # Walk real document BLOCKS (paragraphs) rather than QTextCursor's
+        # EndOfLine/Down, which move by *visual* line - i.e. they also stop
+        # at soft line breaks (Shift+Enter, U+2028) and at word-wrap points.
+        # Growing the text on every step (adding/renumbering markers) while
+        # navigating by visual line was exactly the case that let Down snap
+        # back to the SAME line start forever once a soft-wrapped block's
+        # wrap point shifted mid-loop - an infinite loop (the app hanging)
+        # rather than a clean per-item pass. Blocks aren't affected by
+        # wrapping or soft breaks, so this can't happen here, and it also
+        # matches how every other list-line an item is already treated
+        # elsewhere in this class (one block = one list item).
         counter = 1
-        while cursor.position() <= end:
-            line_start = cursor.position()
-            cursor.movePosition(QTextCursor.EndOfLine)
-            line_end = cursor.position()
+        block = start_block
+        while block.isValid():
+            block_text = block.text()
             
-            cursor.setPosition(line_start)
-            cursor.setPosition(line_end, QTextCursor.KeepAnchor)
-            text = cursor.selectedText()
-            
-            if text.startswith("• ") or text.startswith("- ") or text.startswith("* "):
-                text = text[2:]
-            elif len(text) > 2 and text[0].isdigit() and text[1] == '.' and text[2] == ' ':
-                text = text[3:]
+            if block_text.startswith("• ") or block_text.startswith("- ") or block_text.startswith("* "):
+                content = block_text[2:]
+            elif len(block_text) > 2 and block_text[0].isdigit() and block_text[1] == '.' and block_text[2] == ' ':
+                content = block_text[3:]
+            else:
+                content = block_text
                 
             if not toggle_off:
                 if list_type == "ul":
-                    new_text = "• " + text
+                    new_text = "• " + content
                 else:
-                    new_text = f"{counter}. " + text
-                cursor.insertText(new_text)
+                    new_text = f"{counter}. " + content
                 counter += 1
             else:
-                cursor.insertText(text)
-                
-            if not cursor.movePosition(QTextCursor.Down): break
+                new_text = content
+            
+            if new_text != block_text:
+                replace_cursor = QTextCursor(doc)
+                replace_cursor.setPosition(block.position())
+                replace_cursor.setPosition(block.position() + len(block_text), QTextCursor.KeepAnchor)
+                replace_cursor.insertText(new_text)
+            
+            if block.blockNumber() >= end_block_number:
+                break
+            block = doc.findBlockByNumber(block.blockNumber() + 1)
             
         cursor.endEditBlock()
         editor.setTextCursor(cursor)
