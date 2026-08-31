@@ -3399,7 +3399,19 @@ class Editor(QTextEdit):
                     is_code = (fmt.hasProperty(CODE_PROP) and fmt.property(CODE_PROP) == True) or is_block_code
                     fam_list = fmt.fontFamilies()
                     fam = fam_list[0] if fam_list else ""
-                    if not is_code and fam:
+                    # Only treat a monospace-looking font as a sign of "this run
+                    # was manually made code" if it's actually DIFFERENT from the
+                    # app's own current font_family setting. Otherwise, whenever
+                    # font_family itself is a monospace face (e.g. the default,
+                    # "Consolas"), this would misfire on completely ordinary text/
+                    # headings the moment they carry that same default font -
+                    # which they always do, since this very method just set it on
+                    # them on the previous pass. That created a feedback loop:
+                    # normal text/headings would get flagged as code and start
+                    # being wrapped in ``` on export, every time settings were
+                    # re-applied (e.g. after adding a heading or changing a color
+                    # in Settings/Preferences).
+                    if not is_code and fam and fam.lower() != self.settings['font_family'].lower():
                         if "mono" in fam.lower() or "consolas" in fam.lower() or "courier" in fam.lower():
                             is_code = True
                             fmt.setProperty(CODE_PROP, True)
@@ -5449,38 +5461,54 @@ class MainWindow(QMainWindow):
             
         if is_block:
             cursor.beginEditBlock()
-            start = cursor.selectionStart()
-            end = cursor.selectionEnd()
-            cursor.setPosition(start)
-            
-            first_block_fmt = cursor.blockFormat()
-            toggle_off = (first_block_fmt.hasProperty(BLOCK_CODE_PROP) and first_block_fmt.property(BLOCK_CODE_PROP) == True)
-            
-            while cursor.position() <= end:
-                block_fmt = cursor.blockFormat()
-                new_block_fmt = QTextBlockFormat()
-                new_char_fmt = QTextCharFormat()
-                
-                if toggle_off:
-                    new_block_fmt.setProperty(BLOCK_CODE_PROP, False)
-                    new_block_fmt.setBackground(Qt.transparent)
-                    new_char_fmt.setForeground(QColor(self.settings['editor_text']))
-                    new_char_fmt.setFontFamilies([self.settings['font_family']])
-                    new_char_fmt.setProperty(CODE_PROP, False)
-                    new_char_fmt.setBackground(Qt.transparent)
-                else:
-                    new_block_fmt.setProperty(BLOCK_CODE_PROP, True)
-                    new_block_fmt.setBackground(QColor(self.settings['code_bg']))
-                    new_char_fmt.setForeground(QColor(self.settings['code']))
-                    new_char_fmt.setFontFamilies(["Consolas"])
-                    new_char_fmt.setProperty(CODE_PROP, True)
-                    new_char_fmt.setBackground(Qt.transparent)
-                    
-                cursor.setBlockFormat(new_block_fmt)
-                cursor.mergeCharFormat(new_char_fmt)
-                
-                if not cursor.movePosition(QTextCursor.Down):
-                    break
+            # See toggle_heading() for why this is wrapped in begin_bulk_load()/
+            # end_bulk_load(), and why it walks real document blocks instead of
+            # QTextCursor's visual-line Down.
+            editor.spell_highlighter.begin_bulk_load()
+            try:
+                start = cursor.selectionStart()
+                end = cursor.selectionEnd()
+                doc = editor.document()
+
+                start_block = doc.findBlock(start)
+                end_block = doc.findBlock(end)
+                end_block_number = end_block.blockNumber()
+
+                first_block_fmt = start_block.blockFormat()
+                toggle_off = (first_block_fmt.hasProperty(BLOCK_CODE_PROP) and first_block_fmt.property(BLOCK_CODE_PROP) == True)
+
+                block = start_block
+                while block.isValid():
+                    block_cursor = QTextCursor(doc)
+                    block_cursor.setPosition(block.position())
+                    block_cursor.setPosition(block.position() + max(block.length() - 1, 0), QTextCursor.KeepAnchor)
+
+                    new_block_fmt = QTextBlockFormat()
+                    new_char_fmt = QTextCharFormat()
+
+                    if toggle_off:
+                        new_block_fmt.setProperty(BLOCK_CODE_PROP, False)
+                        new_block_fmt.setBackground(Qt.transparent)
+                        new_char_fmt.setForeground(QColor(self.settings['editor_text']))
+                        new_char_fmt.setFontFamilies([self.settings['font_family']])
+                        new_char_fmt.setProperty(CODE_PROP, False)
+                        new_char_fmt.setBackground(Qt.transparent)
+                    else:
+                        new_block_fmt.setProperty(BLOCK_CODE_PROP, True)
+                        new_block_fmt.setBackground(QColor(self.settings['code_bg']))
+                        new_char_fmt.setForeground(QColor(self.settings['code']))
+                        new_char_fmt.setFontFamilies(["Consolas"])
+                        new_char_fmt.setProperty(CODE_PROP, True)
+                        new_char_fmt.setBackground(Qt.transparent)
+
+                    block_cursor.setBlockFormat(new_block_fmt)
+                    block_cursor.mergeCharFormat(new_char_fmt)
+
+                    if block.blockNumber() >= end_block_number:
+                        break
+                    block = doc.findBlockByNumber(block.blockNumber() + 1)
+            finally:
+                editor.spell_highlighter.end_bulk_load()
             cursor.endEditBlock()
             editor.setTextCursor(cursor)
         else:
@@ -5507,40 +5535,65 @@ class MainWindow(QMainWindow):
         if not editor: return
         cursor = editor.textCursor()
         cursor.beginEditBlock()
-        start = cursor.selectionStart()
-        end = cursor.selectionEnd()
-        cursor.setPosition(start)
-        cursor.movePosition(QTextCursor.StartOfLine)
-        
-        block_fmt_check = cursor.blockFormat()
-        toggle_off = (block_fmt_check.headingLevel() == level)
-        
-        while cursor.position() <= end:
-            line_start = cursor.position()
-            cursor.movePosition(QTextCursor.EndOfLine)
-            line_end = cursor.position()
-            cursor.setPosition(line_start)
-            cursor.setPosition(line_end, QTextCursor.KeepAnchor)
-            
-            block_fmt = cursor.blockFormat()
-            char_fmt = QTextCharFormat()
-            
-            if toggle_off:
-                block_fmt.setHeadingLevel(0)
-                char_fmt.setFontPointSize(self.settings["font_size"])
-                char_fmt.setForeground(QColor(self.settings["editor_text"]))
-                char_fmt.setFontWeight(QFont.Normal)
-            else:
-                block_fmt.setHeadingLevel(level)
-                size = self.settings.get(f"h{level}_size", 0)
-                if size == 0: size = self.settings["font_size"]
-                char_fmt.setFontPointSize(size)
-                char_fmt.setForeground(QColor(self.settings[f"h{level}"]))
-                char_fmt.setFontWeight(QFont.Bold)
-                
-            cursor.setBlockFormat(block_fmt)
-            cursor.mergeCharFormat(char_fmt)
-            if not cursor.movePosition(QTextCursor.Down): break
+        # See toggle_heading() for why this is wrapped in begin_bulk_load()/
+        # end_bulk_load() - same per-line formatting loop, same forced
+        # synchronous spellcheck pass per line otherwise.
+        editor.spell_highlighter.begin_bulk_load()
+        try:
+            start = cursor.selectionStart()
+            end = cursor.selectionEnd()
+            doc = editor.document()
+
+            # Walk real document BLOCKS (paragraphs) rather than QTextCursor's
+            # EndOfLine/Down, which move by *visual* line - i.e. they also
+            # stop at soft line breaks (Shift+Enter, U+2028) and at word-wrap
+            # points. A heading applies a much larger font size, which can
+            # itself shift where a long/wrapped paragraph's wrap points fall
+            # mid-loop; navigating by visual line in that situation is
+            # exactly the case (already hit and fixed the same way in
+            # toggle_list()) that lets Down snap back to the SAME visual line
+            # forever - an infinite loop (the app hanging) instead of a clean
+            # per-paragraph pass. Blocks aren't affected by wrapping or soft
+            # breaks, so this can't happen here.
+            start_block = doc.findBlock(start)
+            end_block = doc.findBlock(end)
+            end_block_number = end_block.blockNumber()
+
+            toggle_off = (start_block.blockFormat().headingLevel() == level)
+
+            block = start_block
+            while block.isValid():
+                block_cursor = QTextCursor(doc)
+                block_cursor.setPosition(block.position())
+                # block.length() includes the trailing paragraph separator;
+                # stop one short of it so the format doesn't spill into the
+                # next block.
+                block_cursor.setPosition(block.position() + max(block.length() - 1, 0), QTextCursor.KeepAnchor)
+
+                block_fmt = block_cursor.blockFormat()
+                char_fmt = QTextCharFormat()
+
+                if toggle_off:
+                    block_fmt.setHeadingLevel(0)
+                    char_fmt.setFontPointSize(self.settings["font_size"])
+                    char_fmt.setForeground(QColor(self.settings["editor_text"]))
+                    char_fmt.setFontWeight(QFont.Normal)
+                else:
+                    block_fmt.setHeadingLevel(level)
+                    size = self.settings.get(f"h{level}_size", 0)
+                    if size == 0: size = self.settings["font_size"]
+                    char_fmt.setFontPointSize(size)
+                    char_fmt.setForeground(QColor(self.settings[f"h{level}"]))
+                    char_fmt.setFontWeight(QFont.Bold)
+
+                block_cursor.setBlockFormat(block_fmt)
+                block_cursor.mergeCharFormat(char_fmt)
+
+                if block.blockNumber() >= end_block_number:
+                    break
+                block = doc.findBlockByNumber(block.blockNumber() + 1)
+        finally:
+            editor.spell_highlighter.end_bulk_load()
         cursor.endEditBlock()
         editor.setTextCursor(cursor)
         self.update_toolbar_state()
@@ -5550,38 +5603,50 @@ class MainWindow(QMainWindow):
         if not editor: return
         cursor = editor.textCursor()
         cursor.beginEditBlock()
-        start = cursor.selectionStart()
-        end = cursor.selectionEnd()
-        cursor.setPosition(start)
-        cursor.movePosition(QTextCursor.StartOfLine)
-        
-        block_fmt_check = cursor.blockFormat()
-        toggle_off = (block_fmt_check.hasProperty(QUOTE_PROP) and block_fmt_check.property(QUOTE_PROP) == True)
-        
-        while cursor.position() <= end:
-            line_start = cursor.position()
-            cursor.movePosition(QTextCursor.EndOfLine)
-            line_end = cursor.position()
-            cursor.setPosition(line_start)
-            cursor.setPosition(line_end, QTextCursor.KeepAnchor)
-            
-            block_fmt = cursor.blockFormat()
-            char_fmt = QTextCharFormat()
-            
-            if toggle_off:
-                block_fmt.setLeftMargin(0)
-                block_fmt.setProperty(QUOTE_PROP, False)
-                char_fmt.setFontItalic(False)
-                char_fmt.setForeground(QColor(self.settings['editor_text']))
-            else:
-                block_fmt.setLeftMargin(15)
-                block_fmt.setProperty(QUOTE_PROP, True)
-                char_fmt.setFontItalic(True)
-                char_fmt.setForeground(QColor(self.settings['quote']))
-                
-            cursor.setBlockFormat(block_fmt)
-            cursor.mergeCharFormat(char_fmt)
-            if not cursor.movePosition(QTextCursor.Down): break
+        # See toggle_heading() for why this is wrapped in begin_bulk_load()/
+        # end_bulk_load(), and why it walks real document blocks instead of
+        # QTextCursor's visual-line EndOfLine/Down.
+        editor.spell_highlighter.begin_bulk_load()
+        try:
+            start = cursor.selectionStart()
+            end = cursor.selectionEnd()
+            doc = editor.document()
+
+            start_block = doc.findBlock(start)
+            end_block = doc.findBlock(end)
+            end_block_number = end_block.blockNumber()
+
+            block_fmt_check = start_block.blockFormat()
+            toggle_off = (block_fmt_check.hasProperty(QUOTE_PROP) and block_fmt_check.property(QUOTE_PROP) == True)
+
+            block = start_block
+            while block.isValid():
+                block_cursor = QTextCursor(doc)
+                block_cursor.setPosition(block.position())
+                block_cursor.setPosition(block.position() + max(block.length() - 1, 0), QTextCursor.KeepAnchor)
+
+                block_fmt = block_cursor.blockFormat()
+                char_fmt = QTextCharFormat()
+
+                if toggle_off:
+                    block_fmt.setLeftMargin(0)
+                    block_fmt.setProperty(QUOTE_PROP, False)
+                    char_fmt.setFontItalic(False)
+                    char_fmt.setForeground(QColor(self.settings['editor_text']))
+                else:
+                    block_fmt.setLeftMargin(15)
+                    block_fmt.setProperty(QUOTE_PROP, True)
+                    char_fmt.setFontItalic(True)
+                    char_fmt.setForeground(QColor(self.settings['quote']))
+
+                block_cursor.setBlockFormat(block_fmt)
+                block_cursor.mergeCharFormat(char_fmt)
+
+                if block.blockNumber() >= end_block_number:
+                    break
+                block = doc.findBlockByNumber(block.blockNumber() + 1)
+        finally:
+            editor.spell_highlighter.end_bulk_load()
         cursor.endEditBlock()
         editor.setTextCursor(cursor)
         self.update_toolbar_state()
