@@ -2845,6 +2845,52 @@ class Editor(QTextEdit):
             super().dragMoveEvent(event)
 
     def keyPressEvent(self, event):
+        if (event.key() == Qt.Key_Space and self.view_mode == "formatted"
+                and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier)):
+            cursor = self.textCursor()
+            if not cursor.hasSelection():
+                block = cursor.block()
+                block_fmt = block.blockFormat()
+                # Don't hijack the space if this line already has some other
+                # special formatting going on (already a heading, inside a
+                # quote/code block, or an HR line) - those have their own
+                # typing behavior and "# " isn't meaningful inside them.
+                already_special = (
+                    block_fmt.headingLevel() > 0
+                    or (block_fmt.hasProperty(QUOTE_PROP) and block_fmt.property(QUOTE_PROP) == True)
+                    or (block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True)
+                    or (block_fmt.hasProperty(HR_PROP) and block_fmt.property(HR_PROP) == True)
+                )
+                if not already_special:
+                    offset = cursor.position() - block.position()
+                    text_before_cursor = block.text()[:offset]
+
+                    m_heading = re.match(r'^(#{1,6})$', text_before_cursor)
+                    m_bullet = re.match(r'^[-\*\+]$', text_before_cursor)
+                    m_numbered = re.match(r'^(\d+)\.$', text_before_cursor)
+                    m_quote = re.match(r'^>$', text_before_cursor)
+
+                    if m_heading or m_bullet or m_numbered or m_quote:
+                        cursor.beginEditBlock()
+                        cursor.setPosition(block.position())
+                        cursor.setPosition(block.position() + offset, QTextCursor.KeepAnchor)
+                        cursor.removeSelectedText()
+                        cursor.endEditBlock()
+                        self.setTextCursor(cursor)
+                        # Each of these reuses the exact same per-block
+                        # formatting code the corresponding toolbar button
+                        # uses, so typing the markdown shortcut and clicking
+                        # the button produce identical results.
+                        if m_heading:
+                            self.window().toggle_heading(len(m_heading.group(1)))
+                        elif m_bullet:
+                            self.window().toggle_list("ul")
+                        elif m_numbered:
+                            self.window().toggle_list("ol")
+                        else:
+                            self.window().toggle_quote()
+                        return
+
         cur_block_fmt = self.textCursor().block().blockFormat()
         if (event.text() and event.key() not in (Qt.Key_Return, Qt.Key_Enter)
                 and cur_block_fmt.hasProperty(HR_PROP)
@@ -2958,6 +3004,58 @@ class Editor(QTextEdit):
                              and block_fmt.property(BLOCK_CODE_PROP) == True)
             is_hr = (block_fmt.hasProperty(HR_PROP)
                      and block_fmt.property(HR_PROP) == True)
+
+            if (self.view_mode == "formatted" and not cursor.hasSelection()
+                    and not is_quote and not is_block_code and not is_hr
+                    and block_fmt.headingLevel() == 0):
+                stripped = block.text().strip()
+                if re.match(r'^```(\S*)$', stripped) and block.text() == stripped:
+                    cursor.beginEditBlock()
+                    cursor.setPosition(block.position())
+                    cursor.setPosition(block.position() + len(block.text()), QTextCursor.KeepAnchor)
+                    cursor.removeSelectedText()
+                    code_block_fmt = QTextBlockFormat()
+                    code_block_fmt.setProperty(BLOCK_CODE_PROP, True)
+                    code_block_fmt.setBackground(QColor(self.settings['code_bg']))
+                    cursor.setBlockFormat(code_block_fmt)
+                    code_char_fmt = QTextCharFormat()
+                    code_char_fmt.setForeground(QColor(self.settings['code']))
+                    code_char_fmt.setFontFamilies(["Consolas"])
+                    code_char_fmt.setProperty(CODE_PROP, True)
+                    cursor.setCharFormat(code_char_fmt)
+                    cursor.endEditBlock()
+                    self.setTextCursor(cursor)
+                    self.window().update_toolbar_state()
+                    return
+
+            if (self.view_mode == "formatted" and not cursor.hasSelection()
+                    and not is_quote and not is_block_code and not is_hr
+                    and block_fmt.headingLevel() == 0):
+                stripped = block.text().strip()
+                if re.match(r'^(-{3,}|\*{3,}|_{3,})$', stripped) and block.text() == stripped:
+                    cursor.beginEditBlock()
+                    cursor.setPosition(block.position())
+                    cursor.setPosition(block.position() + len(block.text()), QTextCursor.KeepAnchor)
+                    cursor.removeSelectedText()
+                    hr_fmt = QTextBlockFormat()
+                    hr_fmt.setProperty(HR_PROP, True)
+                    cursor.setBlockFormat(hr_fmt)
+                    cursor.setCharFormat(QTextCharFormat())
+                    # A fresh, normally-formatted line below it to keep
+                    # typing on, matching what clicking the "Insert
+                    # horizontal line" toolbar button leaves the cursor on.
+                    cursor.insertBlock()
+                    normal_fmt = QTextBlockFormat()
+                    cursor.setBlockFormat(normal_fmt)
+                    normal_char = QTextCharFormat()
+                    normal_char.setForeground(QColor(self.settings['editor_text']))
+                    normal_char.setFontFamilies([self.settings['font_family']])
+                    normal_char.setFontPointSize(self.settings['font_size'])
+                    cursor.setCharFormat(normal_char)
+                    cursor.endEditBlock()
+                    self.setTextCursor(cursor)
+                    self.window().update_toolbar_state()
+                    return
 
             if is_hr:
                 # A horizontal-line block is always empty; pressing Enter on
@@ -3130,6 +3228,86 @@ class Editor(QTextEdit):
                         cursor.insertText(f"{indent}{new_marker}{spacing}")
                         cursor.endEditBlock()
                         self.setTextCursor(cursor)
+                        return
+
+        if (self.view_mode == "formatted" and event.text() in ('*', '_', '`')
+                and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier)):
+            cursor = self.textCursor()
+            if not cursor.hasSelection():
+                block = cursor.block()
+                block_fmt = block.blockFormat()
+                cur_fmt = cursor.charFormat()
+                inside_block_code = (block_fmt.hasProperty(BLOCK_CODE_PROP)
+                                      and block_fmt.property(BLOCK_CODE_PROP) == True)
+                inside_inline_code = (cur_fmt.hasProperty(CODE_PROP)
+                                       and cur_fmt.property(CODE_PROP) == True)
+                if not inside_block_code and not inside_inline_code:
+                    offset = cursor.position() - block.position()
+                    # Simulate the character actually landing at the end of
+                    # the text typed so far, without inserting it yet - lets
+                    # a plain, non-matching '*'/'_'/'`' fall straight through
+                    # to the normal insertion path below instead of needing
+                    # a separate "undo the speculative insert" step.
+                    candidate = block.text()[:offset] + event.text()
+                    m = None
+                    action = None
+                    if event.text() == '`':
+                        m = re.search(r'`([^`\n]+)`$', candidate)
+                        action = 'code'
+                    elif event.text() == '*':
+                        m = re.search(r'\*\*([^\*\n]+)\*\*$', candidate)
+                        action = 'bold'
+                        if not m:
+                            m = re.search(r'(?<!\*)\*([^\*\n]+)\*$', candidate)
+                            action = 'italic'
+                    elif event.text() == '_':
+                        m = re.search(r'__([^_\n]+)__$', candidate)
+                        action = 'bold'
+                        if not m:
+                            m = re.search(r'(?<!_)_([^_\n]+)_$', candidate)
+                            action = 'italic'
+                    if m:
+                        content = m.group(1)
+                        start_off = m.start()
+                        doc = self.document()
+                        cursor.beginEditBlock()
+                        cursor.setPosition(block.position() + start_off)
+                        cursor.setPosition(block.position() + offset, QTextCursor.KeepAnchor)
+                        cursor.removeSelectedText()
+                        cursor.insertText(content)
+                        cursor.endEditBlock()
+                        sel = QTextCursor(doc)
+                        sel.setPosition(block.position() + start_off)
+                        sel.setPosition(block.position() + start_off + len(content), QTextCursor.KeepAnchor)
+                        self.setTextCursor(sel)
+                        # Reuses the exact same toggle used by the Bold/
+                        # Italic/Code toolbar buttons, so the live shortcut
+                        # and the button produce identical formatting.
+                        if action == 'bold':
+                            self.window().toggle_bold()
+                        elif action == 'italic':
+                            self.window().toggle_italic()
+                        else:
+                            self.window().toggle_code()
+                        # Land a plain caret right after the transformed
+                        # text with NORMAL formatting - otherwise every
+                        # character typed next would keep inheriting
+                        # bold/italic/code, the way it would after any
+                        # ordinary selection-based toggle.
+                        end_pos = block.position() + start_off + len(content)
+                        normal_fmt = QTextCharFormat()
+                        normal_fmt.setForeground(QColor(self.settings['editor_text']))
+                        normal_fmt.setFontFamilies([self.settings['font_family']])
+                        normal_fmt.setFontPointSize(self.settings['font_size'])
+                        normal_fmt.setFontWeight(QFont.Normal)
+                        normal_fmt.setFontItalic(False)
+                        normal_fmt.setFontUnderline(False)
+                        normal_fmt.setProperty(CODE_PROP, False)
+                        normal_fmt.setBackground(Qt.transparent)
+                        end_cursor = QTextCursor(doc)
+                        end_cursor.setPosition(end_pos)
+                        end_cursor.setCharFormat(normal_fmt)
+                        self.setTextCursor(end_cursor)
                         return
 
         super().keyPressEvent(event)
@@ -3437,7 +3615,18 @@ class Editor(QTextEdit):
                     elif level > 0:
                         fmt.setForeground(QColor(self.settings[f"h{level}"]))
                         size = self.settings.get(f"h{level}_size", 0)
-                        if size == 0: size = self.settings["font_size"]
+                        # 0 means "Default" in the Style Configuration dialog's
+                        # spinbox. Falling back to the global font_size here
+                        # would make every heading level the same size as
+                        # body text (only the color would still differ per
+                        # level) - not what "Default" is supposed to mean.
+                        # The Formatted-view CSS stylesheet (see
+                        # get_preview_html/apply_app_theme) already falls
+                        # back to this heading level's own classic default
+                        # size (24/20/18/16/14/13) instead; match that here
+                        # so headings keep a proper cascading scale even when
+                        # sized at "Default".
+                        if size == 0: size = DEFAULT_SETTINGS.get(f"h{level}_size", self.settings["font_size"])
                         fmt.setFontFamilies([self.settings['font_family']])
                         fmt.setFontPointSize(size)
                         fmt.setFontWeight(QFont.Bold)
@@ -4203,6 +4392,7 @@ class FindReplaceDialog(QDialog):
 
         self.find_input = QLineEdit()
         self.find_input.returnPressed.connect(self.find_next)
+        self.find_input.textChanged.connect(self._update_match_count)
         layout.addRow("Find:", self.find_input)
 
         self.replace_input = QLineEdit()
@@ -4210,6 +4400,7 @@ class FindReplaceDialog(QDialog):
         layout.addRow("Replace with:", self.replace_input)
 
         self.case_check = QCheckBox("Case sensitive")
+        self.case_check.toggled.connect(self._update_match_count)
         layout.addRow("", self.case_check)
 
         find_btn_row = QWidget()
@@ -4253,6 +4444,57 @@ class FindReplaceDialog(QDialog):
             flags |= QTextDocument.FindBackward
         return flags
 
+    def _count_matches(self, text):
+        editor = self.get_editor()
+        if not editor or not text:
+            return 0
+        doc = editor.document()
+        flags = self._flags(backward=False)
+        count = 0
+        cursor = QTextCursor(doc)
+        while True:
+            cursor = doc.find(text, cursor, flags)
+            if cursor.isNull():
+                break
+            count += 1
+        return count
+
+    def _match_position(self, text):
+        """Total match count, plus the 1-based index of whichever match the
+        editor's current selection sits on (0 if the selection isn't a
+        match - e.g. before Find Next/Previous has been used yet)."""
+        editor = self.get_editor()
+        if not editor or not text:
+            return 0, 0
+        doc = editor.document()
+        flags = self._flags(backward=False)
+        sel_cursor = editor.textCursor()
+        sel_start = sel_cursor.selectionStart() if sel_cursor.hasSelection() else None
+        total = 0
+        current_index = 0
+        cursor = QTextCursor(doc)
+        while True:
+            cursor = doc.find(text, cursor, flags)
+            if cursor.isNull():
+                break
+            total += 1
+            if sel_start is not None and cursor.selectionStart() == sel_start:
+                current_index = total
+        return current_index, total
+
+    def _update_match_count(self):
+        text = self.find_input.text()
+        if not text:
+            self.status_label.setText("")
+            return
+        current_index, total = self._match_position(text)
+        if total == 0:
+            self.status_label.setText("Phrase not found")
+        elif current_index:
+            self.status_label.setText(f"{current_index}/{total}")
+        else:
+            self.status_label.setText(f"{total} occurrence{'s' if total != 1 else ''} found")
+
     def _find(self, backward):
         editor = self.get_editor()
         if not editor:
@@ -4269,10 +4511,10 @@ class FindReplaceDialog(QDialog):
             cursor.movePosition(QTextCursor.End if backward else QTextCursor.Start)
             editor.setTextCursor(cursor)
             found = editor.find(text, self._flags(backward))
-        if found:
-            self.status_label.setText("")
-        else:
-            self.status_label.setText("Phrase not found")
+        # Report the total match count regardless of whether this
+        # particular jump succeeded - "Phrase not found" only makes sense
+        # when there really are zero matches in the whole document.
+        self._update_match_count()
 
     def find_next(self):
         self._find(backward=False)
@@ -4336,6 +4578,7 @@ class FindReplaceDialog(QDialog):
                 self.find_input.setText(selected)
         self.find_input.setFocus()
         self.find_input.selectAll()
+        self._update_match_count()
 
 
 class MainWindow(QMainWindow):
@@ -5508,8 +5751,8 @@ class MainWindow(QMainWindow):
                         break
                     block = doc.findBlockByNumber(block.blockNumber() + 1)
             finally:
+                cursor.endEditBlock()
                 editor.spell_highlighter.end_bulk_load()
-            cursor.endEditBlock()
             editor.setTextCursor(cursor)
         else:
             fmt = cursor.charFormat()
@@ -5561,6 +5804,24 @@ class MainWindow(QMainWindow):
 
             toggle_off = (start_block.blockFormat().headingLevel() == level)
 
+            # Same for every block touched by this call (one toggle_off/
+            # level per call, not per block) - computed once instead of
+            # inside the loop below.
+            char_fmt = QTextCharFormat()
+            if toggle_off:
+                char_fmt.setFontPointSize(self.settings["font_size"])
+                char_fmt.setForeground(QColor(self.settings["editor_text"]))
+                char_fmt.setFontWeight(QFont.Normal)
+            else:
+                size = self.settings.get(f"h{level}_size", 0)
+                # See apply_settings_to_document() for why this falls
+                # back to the heading level's own default size (not the
+                # global font_size) when sized at "Default" (0).
+                if size == 0: size = DEFAULT_SETTINGS.get(f"h{level}_size", self.settings["font_size"])
+                char_fmt.setFontPointSize(size)
+                char_fmt.setForeground(QColor(self.settings[f"h{level}"]))
+                char_fmt.setFontWeight(QFont.Bold)
+
             block = start_block
             while block.isValid():
                 block_cursor = QTextCursor(doc)
@@ -5571,31 +5832,36 @@ class MainWindow(QMainWindow):
                 block_cursor.setPosition(block.position() + max(block.length() - 1, 0), QTextCursor.KeepAnchor)
 
                 block_fmt = block_cursor.blockFormat()
-                char_fmt = QTextCharFormat()
-
-                if toggle_off:
-                    block_fmt.setHeadingLevel(0)
-                    char_fmt.setFontPointSize(self.settings["font_size"])
-                    char_fmt.setForeground(QColor(self.settings["editor_text"]))
-                    char_fmt.setFontWeight(QFont.Normal)
-                else:
-                    block_fmt.setHeadingLevel(level)
-                    size = self.settings.get(f"h{level}_size", 0)
-                    if size == 0: size = self.settings["font_size"]
-                    char_fmt.setFontPointSize(size)
-                    char_fmt.setForeground(QColor(self.settings[f"h{level}"]))
-                    char_fmt.setFontWeight(QFont.Bold)
+                block_fmt.setHeadingLevel(0 if toggle_off else level)
 
                 block_cursor.setBlockFormat(block_fmt)
+                # mergeCharFormat() on an empty block (anchor == position,
+                # nothing actually selected) touches zero characters, so it
+                # alone can't fix up an empty heading line - see the
+                # explicit cursor.setCharFormat() below for that case.
                 block_cursor.mergeCharFormat(char_fmt)
 
                 if block.blockNumber() >= end_block_number:
                     break
                 block = doc.findBlockByNumber(block.blockNumber() + 1)
         finally:
+            cursor.endEditBlock()
             editor.spell_highlighter.end_bulk_load()
-        cursor.endEditBlock()
         editor.setTextCursor(cursor)
+        if not cursor.hasSelection():
+            # The block(s) just got their character formatting rewritten via
+            # separate, throwaway block_cursor objects above - the actual
+            # editor cursor being restored here never had setCharFormat()
+            # called on it. For a normal selection that's harmless (there's
+            # existing text already carrying the new format to look at),
+            # but for a bare caret - most commonly an empty line, e.g. right
+            # after the "# " live-heading shortcut, or clicking a heading
+            # button before typing anything - there are no characters yet
+            # for mergeCharFormat() to have touched, so without this the
+            # next characters typed would silently keep the old formatting
+            # instead of picking up the heading's size/color/weight.
+            cursor.setCharFormat(char_fmt)
+            editor.setTextCursor(cursor)
         self.update_toolbar_state()
 
     def toggle_quote(self):
@@ -5619,6 +5885,14 @@ class MainWindow(QMainWindow):
             block_fmt_check = start_block.blockFormat()
             toggle_off = (block_fmt_check.hasProperty(QUOTE_PROP) and block_fmt_check.property(QUOTE_PROP) == True)
 
+            char_fmt = QTextCharFormat()
+            if toggle_off:
+                char_fmt.setFontItalic(False)
+                char_fmt.setForeground(QColor(self.settings['editor_text']))
+            else:
+                char_fmt.setFontItalic(True)
+                char_fmt.setForeground(QColor(self.settings['quote']))
+
             block = start_block
             while block.isValid():
                 block_cursor = QTextCursor(doc)
@@ -5626,29 +5900,28 @@ class MainWindow(QMainWindow):
                 block_cursor.setPosition(block.position() + max(block.length() - 1, 0), QTextCursor.KeepAnchor)
 
                 block_fmt = block_cursor.blockFormat()
-                char_fmt = QTextCharFormat()
-
                 if toggle_off:
                     block_fmt.setLeftMargin(0)
                     block_fmt.setProperty(QUOTE_PROP, False)
-                    char_fmt.setFontItalic(False)
-                    char_fmt.setForeground(QColor(self.settings['editor_text']))
                 else:
                     block_fmt.setLeftMargin(15)
                     block_fmt.setProperty(QUOTE_PROP, True)
-                    char_fmt.setFontItalic(True)
-                    char_fmt.setForeground(QColor(self.settings['quote']))
 
                 block_cursor.setBlockFormat(block_fmt)
+                # See toggle_heading() for why an empty block needs the
+                # explicit cursor.setCharFormat() below too.
                 block_cursor.mergeCharFormat(char_fmt)
 
                 if block.blockNumber() >= end_block_number:
                     break
                 block = doc.findBlockByNumber(block.blockNumber() + 1)
         finally:
+            cursor.endEditBlock()
             editor.spell_highlighter.end_bulk_load()
-        cursor.endEditBlock()
         editor.setTextCursor(cursor)
+        if not cursor.hasSelection():
+            cursor.setCharFormat(char_fmt)
+            editor.setTextCursor(cursor)
         self.update_toolbar_state()
 
     def toggle_list(self, list_type):
@@ -5675,7 +5948,21 @@ class MainWindow(QMainWindow):
             if is_ul: toggle_off = True
         else:
             if is_ol: toggle_off = True
-        
+
+        # A marker's own formatting - deliberately plain, so it never
+        # inherits whatever character format (link, bold, custom color...)
+        # happens to sit at the start of the line's actual content.
+        marker_fmt = QTextCharFormat()
+        marker_fmt.setForeground(QColor(self.settings['editor_text']))
+        marker_fmt.setFontFamilies([self.settings['font_family']])
+        marker_fmt.setFontPointSize(self.settings['font_size'])
+        marker_fmt.setFontWeight(QFont.Normal)
+        marker_fmt.setFontItalic(False)
+        marker_fmt.setFontUnderline(False)
+        marker_fmt.setAnchor(False)
+        marker_fmt.setAnchorHref("")
+        marker_fmt.setProperty(CODE_PROP, False)
+
         # Walk real document BLOCKS (paragraphs) rather than QTextCursor's
         # EndOfLine/Down, which move by *visual* line - i.e. they also stop
         # at soft line breaks (Shift+Enter, U+2028) and at word-wrap points.
@@ -5691,29 +5978,37 @@ class MainWindow(QMainWindow):
         block = start_block
         while block.isValid():
             block_text = block.text()
-            
+
             if block_text.startswith("• ") or block_text.startswith("- ") or block_text.startswith("* "):
-                content = block_text[2:]
+                old_marker_len = 2
             elif len(block_text) > 2 and block_text[0].isdigit() and block_text[1] == '.' and block_text[2] == ' ':
-                content = block_text[3:]
+                old_marker_len = 3
             else:
-                content = block_text
-                
+                old_marker_len = 0
+
             if not toggle_off:
                 if list_type == "ul":
-                    new_text = "• " + content
+                    new_marker = "• "
                 else:
-                    new_text = f"{counter}. " + content
+                    new_marker = f"{counter}. "
                 counter += 1
             else:
-                new_text = content
-            
-            if new_text != block_text:
-                replace_cursor = QTextCursor(doc)
-                replace_cursor.setPosition(block.position())
-                replace_cursor.setPosition(block.position() + len(block_text), QTextCursor.KeepAnchor)
-                replace_cursor.insertText(new_text)
-            
+                new_marker = ""
+
+            old_marker = block_text[:old_marker_len]
+            if new_marker != old_marker:
+                # Only the marker prefix is ever selected/replaced here -
+                # the rest of the line's text (and its formatting, whatever
+                # it is) is never touched, so it can't be flattened into one
+                # uniform format the way replacing the whole line used to.
+                edit_cursor = QTextCursor(doc)
+                edit_cursor.setPosition(block.position())
+                if old_marker_len:
+                    edit_cursor.setPosition(block.position() + old_marker_len, QTextCursor.KeepAnchor)
+                    edit_cursor.removeSelectedText()
+                if new_marker:
+                    edit_cursor.insertText(new_marker, marker_fmt)
+
             if block.blockNumber() >= end_block_number:
                 break
             block = doc.findBlockByNumber(block.blockNumber() + 1)
@@ -6210,10 +6505,19 @@ class MainWindow(QMainWindow):
         if not editor: return
         self.act_view_formatted.blockSignals(True)
         self.act_view_plain.blockSignals(True)
-        if editor.view_mode == "plain":
-            self.act_view_plain.setChecked(True)
-        else:
-            self.act_view_formatted.setChecked(True)
+        # Don't rely on view_action_group's exclusivity here: a QActionGroup
+        # enforces "only one checked" by listening to each member action's
+        # own toggled signal and un-checking its siblings when one fires -
+        # but blockSignals() above (needed so setChecked() here doesn't
+        # re-trigger set_view_mode() through the actions' triggered/toggled
+        # connections) also blocks that internal toggled signal. So calling
+        # setChecked(True) on just one action never told the group to
+        # un-check the other, and both ended up showing as checked at once
+        # once the previously-active one had already been checked before.
+        # Setting both explicitly avoids depending on that signal at all.
+        is_plain = (editor.view_mode == "plain")
+        self.act_view_plain.setChecked(is_plain)
+        self.act_view_formatted.setChecked(not is_plain)
         self.act_view_formatted.blockSignals(False)
         self.act_view_plain.blockSignals(False)
 
