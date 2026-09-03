@@ -5862,6 +5862,30 @@ class MainWindow(QMainWindow):
             # instead of picking up the heading's size/color/weight.
             cursor.setCharFormat(char_fmt)
             editor.setTextCursor(cursor)
+        # A heading change is a big font-size jump. QTextDocumentLayout
+        # caches each block's bounding rect/height and recomputes it
+        # lazily (see the same issue documented in Editor.paintEvent()),
+        # so without forcing that recompute here, the next repaint can
+        # still paint the old size - which is why switching to Plain
+        # Text and back (a full setPlainText() reparse) "fixes" it:
+        # that path forces a fresh layout from scratch, this one
+        # doesn't. documentSize() forces any pending layout pass to
+        # finish.
+        #
+        # A plain viewport().update() only *schedules* a repaint, and
+        # (see _reset_caret_blink() for the same issue previously found
+        # with the caret) that scheduled repaint can be coalesced away
+        # or dropped - on some setups it takes a real event, like the
+        # cursor blink's own periodic repaint(), before this block
+        # actually gets redrawn, which is what made it look like the
+        # fix only ever "took" after switching Plain Text view and
+        # back. Forcing a synchronous repaint() now, plus one more
+        # chained on the next event-loop turn as insurance, matches
+        # that same battle-tested pattern instead of trusting a single
+        # scheduled update() to survive.
+        editor.document().documentLayout().documentSize()
+        editor.viewport().repaint()
+        QTimer.singleShot(0, lambda ed=editor: (ed.document().documentLayout().documentSize(), ed.viewport().repaint()))
         self.update_toolbar_state()
 
     def toggle_quote(self):
@@ -5922,6 +5946,11 @@ class MainWindow(QMainWindow):
         if not cursor.hasSelection():
             cursor.setCharFormat(char_fmt)
             editor.setTextCursor(cursor)
+        # See toggle_heading() for why this forced layout+repaint is
+        # needed after a block-format change like this.
+        editor.document().documentLayout().documentSize()
+        editor.viewport().repaint()
+        QTimer.singleShot(0, lambda ed=editor: (ed.document().documentLayout().documentSize(), ed.viewport().repaint()))
         self.update_toolbar_state()
 
     def toggle_list(self, list_type):
