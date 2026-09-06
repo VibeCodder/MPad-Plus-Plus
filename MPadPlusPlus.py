@@ -5773,6 +5773,76 @@ class MainWindow(QMainWindow):
             
         self.update_toolbar_state()
 
+    def _apply_char_format_to_block(self, doc, block, char_fmt):
+        """Apply char_fmt to every character in `block`, per fragment (so
+        existing inline formatting - bold/italic spans, links, embedded
+        images - is preserved rather than flattened), working around a
+        genuine Qt/PySide bug that made toggle_heading()/toggle_quote()
+        silently fail to ever repaint at the new size after the first
+        toggle of a given line.
+
+        Root cause (confirmed by inspecting the actual QTextCharFormat
+        Qt produces): document().setMarkdown() renders headings using a
+        *relative* QTextFormat.FontSizeAdjustment property (like HTML's
+        h1-h6 cascading off the base font size), not an absolute
+        fontPointSize - a block's very first fragment right after import
+        has fontPointSize() == 0 and FontSizeAdjustment == 3 (for h1),
+        etc. mergeCharFormat() - what this used to call, and what every
+        earlier attempt at fixing this still used under the hood - only
+        ever ADDS/OVERRIDES properties that are actually present on the
+        format you pass it; it can't clear a property it doesn't know
+        about, so that leftover FontSizeAdjustment survives every
+        mergeCharFormat() call forever, and Qt's font resolution keeps
+        applying it, which is what visually pinned the block at
+        whatever size the *first* successful change happened to produce
+        - explicit fontPointSize() looked correct when queried right
+        back, but the adjustment kept overriding it at paint time.
+        Forcing documentLayout().documentSize(), markContentsDirty(),
+        block.layout().clearLayout(), a synchronous repaint(), or even
+        deleting and re-inserting the block's text all failed to fix
+        this, because none of them touch FontSizeAdjustment either.
+
+        The fix is two-part, and BOTH parts are required (confirmed by
+        testing each alone): explicitly clear FontSizeAdjustment on the
+        format being applied, AND apply it with setCharFormat() (which
+        replaces a fragment's format outright) rather than
+        mergeCharFormat() (which - even passed a format with
+        FontSizeAdjustment explicitly zeroed - was still observed to get
+        stuck after the first toggle in testing, for reasons that could
+        not be fully pinned down but are moot given setCharFormat()
+        works reliably instead).
+
+        Two passes, deliberately: the first only *reads* frag.position()/
+        length()/charFormat() into a plain list while walking the
+        block's fragment iterator; the second does the actual
+        setCharFormat() edits afterwards, once that iterator is no
+        longer in use. setCharFormat() can merge/split/reallocate the
+        block's underlying fragment map (e.g. when a fragment's format
+        ends up identical to its neighbour's), which invalidates the
+        very iterator that produced it - editing through it in a single
+        combined pass crashed the interpreter (a real, reproducible
+        segfault, not just wrong results) as soon as a block had more
+        than one fragment.
+        """
+        frag_specs = []
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            if frag.isValid() and frag.length() > 0:
+                frag_specs.append((frag.position(), frag.length(), QTextCharFormat(frag.charFormat())))
+            it += 1
+
+        touched = False
+        for frag_pos, frag_len, frag_fmt in frag_specs:
+            frag_fmt.clearProperty(QTextFormat.FontSizeAdjustment)
+            frag_fmt.merge(char_fmt)
+            frag_cursor = QTextCursor(doc)
+            frag_cursor.setPosition(frag_pos)
+            frag_cursor.setPosition(frag_pos + frag_len, QTextCursor.KeepAnchor)
+            frag_cursor.setCharFormat(frag_fmt)
+            touched = True
+        return touched
+
     def toggle_heading(self, level):
         editor = self.get_editor()
         if not editor: return
@@ -5835,11 +5905,14 @@ class MainWindow(QMainWindow):
                 block_fmt.setHeadingLevel(0 if toggle_off else level)
 
                 block_cursor.setBlockFormat(block_fmt)
-                # mergeCharFormat() on an empty block (anchor == position,
-                # nothing actually selected) touches zero characters, so it
-                # alone can't fix up an empty heading line - see the
-                # explicit cursor.setCharFormat() below for that case.
-                block_cursor.mergeCharFormat(char_fmt)
+                # See _apply_char_format_to_block()'s docstring for why this
+                # applies the format per-fragment via setCharFormat() rather
+                # than a single mergeCharFormat() call - the latter left a
+                # heading permanently stuck at whatever size the *first*
+                # toggle happened to produce. touched is False only for an
+                # empty block (nothing to apply to) - see the explicit
+                # cursor.setCharFormat() fallback below for that case.
+                touched = self._apply_char_format_to_block(doc, block, char_fmt)
 
                 if block.blockNumber() >= end_block_number:
                     break
@@ -5850,42 +5923,19 @@ class MainWindow(QMainWindow):
         editor.setTextCursor(cursor)
         if not cursor.hasSelection():
             # The block(s) just got their character formatting rewritten via
-            # separate, throwaway block_cursor objects above - the actual
-            # editor cursor being restored here never had setCharFormat()
-            # called on it. For a normal selection that's harmless (there's
-            # existing text already carrying the new format to look at),
-            # but for a bare caret - most commonly an empty line, e.g. right
-            # after the "# " live-heading shortcut, or clicking a heading
-            # button before typing anything - there are no characters yet
-            # for mergeCharFormat() to have touched, so without this the
-            # next characters typed would silently keep the old formatting
-            # instead of picking up the heading's size/color/weight.
+            # separate, throwaway cursors above - the actual editor cursor
+            # being restored here never had setCharFormat() called on it.
+            # For a normal selection that's harmless (there's existing text
+            # already carrying the new format to look at), but for a bare
+            # caret - most commonly an empty line, e.g. right after the
+            # "# " live-heading shortcut, or clicking a heading button
+            # before typing anything - there are no characters yet for
+            # _apply_char_format_to_block() to have touched, so without this
+            # the next characters typed would silently keep the old
+            # formatting instead of picking up the heading's size/color/
+            # weight.
             cursor.setCharFormat(char_fmt)
             editor.setTextCursor(cursor)
-        # A heading change is a big font-size jump. QTextDocumentLayout
-        # caches each block's bounding rect/height and recomputes it
-        # lazily (see the same issue documented in Editor.paintEvent()),
-        # so without forcing that recompute here, the next repaint can
-        # still paint the old size - which is why switching to Plain
-        # Text and back (a full setPlainText() reparse) "fixes" it:
-        # that path forces a fresh layout from scratch, this one
-        # doesn't. documentSize() forces any pending layout pass to
-        # finish.
-        #
-        # A plain viewport().update() only *schedules* a repaint, and
-        # (see _reset_caret_blink() for the same issue previously found
-        # with the caret) that scheduled repaint can be coalesced away
-        # or dropped - on some setups it takes a real event, like the
-        # cursor blink's own periodic repaint(), before this block
-        # actually gets redrawn, which is what made it look like the
-        # fix only ever "took" after switching Plain Text view and
-        # back. Forcing a synchronous repaint() now, plus one more
-        # chained on the next event-loop turn as insurance, matches
-        # that same battle-tested pattern instead of trusting a single
-        # scheduled update() to survive.
-        editor.document().documentLayout().documentSize()
-        editor.viewport().repaint()
-        QTimer.singleShot(0, lambda ed=editor: (ed.document().documentLayout().documentSize(), ed.viewport().repaint()))
         self.update_toolbar_state()
 
     def toggle_quote(self):
@@ -5932,9 +5982,11 @@ class MainWindow(QMainWindow):
                     block_fmt.setProperty(QUOTE_PROP, True)
 
                 block_cursor.setBlockFormat(block_fmt)
-                # See toggle_heading() for why an empty block needs the
-                # explicit cursor.setCharFormat() below too.
-                block_cursor.mergeCharFormat(char_fmt)
+                # See toggle_heading()/_apply_char_format_to_block() for why
+                # this applies per-fragment via setCharFormat() instead of
+                # mergeCharFormat(), and why an empty block needs the
+                # explicit cursor.setCharFormat() fallback below too.
+                touched = self._apply_char_format_to_block(doc, block, char_fmt)
 
                 if block.blockNumber() >= end_block_number:
                     break
@@ -5946,11 +5998,6 @@ class MainWindow(QMainWindow):
         if not cursor.hasSelection():
             cursor.setCharFormat(char_fmt)
             editor.setTextCursor(cursor)
-        # See toggle_heading() for why this forced layout+repaint is
-        # needed after a block-format change like this.
-        editor.document().documentLayout().documentSize()
-        editor.viewport().repaint()
-        QTimer.singleShot(0, lambda ed=editor: (ed.document().documentLayout().documentSize(), ed.viewport().repaint()))
         self.update_toolbar_state()
 
     def toggle_list(self, list_type):
