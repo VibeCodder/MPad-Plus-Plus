@@ -3573,7 +3573,22 @@ class Editor(QTextEdit):
                 if frag.isValid() and frag.length() > 0:
                     fmt = QTextCharFormat(frag.charFormat())
                     changed = False
-                    
+
+                    # document().setMarkdown() renders headings using a
+                    # *relative* QTextFormat.FontSizeAdjustment property
+                    # (like HTML's h1-h6 cascading off the base font size)
+                    # rather than an absolute fontPointSize - see
+                    # _apply_char_format_to_block()'s docstring for the full
+                    # root-cause writeup. Left in place, that leftover
+                    # adjustment keeps overriding the explicit
+                    # setFontPointSize() calls below at paint time (sizes
+                    # still look small/wrong right after File > Open or a
+                    # Plain -> Formatted switch), even though setCharFormat()
+                    # is used below instead of mergeCharFormat(). Clear it
+                    # unconditionally, for every fragment, before any branch
+                    # below sets its own size.
+                    fmt.clearProperty(QTextFormat.FontSizeAdjustment)
+
                     is_code = (fmt.hasProperty(CODE_PROP) and fmt.property(CODE_PROP) == True) or is_block_code
                     fam_list = fmt.fontFamilies()
                     fam = fam_list[0] if fam_list else ""
