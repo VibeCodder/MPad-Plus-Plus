@@ -5053,10 +5053,45 @@ class MainWindow(QMainWindow):
         # SAME md_lines entry (no extra raw "\n" in between) - see the
         # comment on needs_paragraph_break_marker() below for why.
         pending_br_merge = False
+        # A genuinely empty plain block (the user just pressing Enter to
+        # leave a visible blank line) can't be written out as a literal
+        # blank raw-markdown line: CommonMark treats any run of one or
+        # more blank lines as exactly the same thing - a single paragraph
+        # break - so on the next import every blank line the user typed
+        # collapses away entirely, regardless of how many Enters they
+        # pressed. Instead, each empty block appends one "<br>" onto the
+        # END of the previous exported line. Qt's Markdown importer folds
+        # a trailing "<br/>" into the preceding block as a real U+2028
+        # line-separator character (confirmed to also work for multiple
+        # stacked "<br>"s, and even right after headings/quotes/lists/hr),
+        # so the blank line survives the round trip instead of vanishing.
+        # Once a real (non-empty) block is reached, the run is closed off
+        # with a normal blank-line separator before that block's own text -
+        # EXCEPT when the run sits at the very start of the document (no
+        # earlier line to attach the "<br>"s to yet, so they were appended
+        # as their own leading entry). There, a blank-line separator would
+        # actually add an unwanted extra blank line (Qt merges an isolated
+        # leading "<br/>...<br/>" HTML block into TWO empty sub-lines - one
+        # on each side of it - since it has no preceding text to attach to
+        # as a trailing break); gluing the next real line directly onto
+        # that same leading entry instead (reusing pending_br_merge) keeps
+        # the count exactly right.
+        pending_blank_run = False
+        pending_blank_leading = False
 
         def ensure_blank_separator():
             if md_lines and md_lines[-1] != "":
                 md_lines.append("")
+
+        def flush_pending_blank_run():
+            nonlocal pending_blank_run, pending_blank_leading, pending_br_merge
+            if pending_blank_run:
+                if pending_blank_leading:
+                    pending_br_merge = True
+                else:
+                    ensure_blank_separator()
+                pending_blank_run = False
+                pending_blank_leading = False
 
         def needs_paragraph_break_marker(block):
             # Two adjacent plain paragraph blocks (created by pressing
@@ -5128,6 +5163,7 @@ class MainWindow(QMainWindow):
                     if prev_was_quote:
                         ensure_blank_separator()
                         prev_was_quote = False
+                    flush_pending_blank_run()
                     pending_br_merge = False
                     self.export_table_to_md(table, md_lines)
                     temp_cursor.setPosition(table.lastPosition() + 1)
@@ -5152,7 +5188,18 @@ class MainWindow(QMainWindow):
             if prev_was_quote and not is_quote:
                 ensure_blank_separator()
             prev_was_quote = is_quote
-            
+
+            # A plain, unformatted, empty block is the spacer line itself -
+            # it must NOT flush the run (it's what's accumulating it; see
+            # the "text == ''" branch far below). Everything else - real
+            # content of any kind, even a rare empty heading/quote/code
+            # line - closes the run off first.
+            is_plain_empty_spacer = (text == "" and not is_hr
+                                      and not is_block_code and level == 0
+                                      and not is_quote)
+            if not is_plain_empty_spacer:
+                flush_pending_blank_run()
+
             if is_hr:
                 pending_br_merge = False
                 if in_code_block:
@@ -5207,7 +5254,12 @@ class MainWindow(QMainWindow):
                 else:
                     if text == "":
                         pending_br_merge = False
-                        md_lines.append("")
+                        if md_lines:
+                            md_lines[-1] += "<br>"
+                        else:
+                            md_lines.append("<br>")
+                            pending_blank_leading = True
+                        pending_blank_run = True
                     else:
                         line = self.get_inline_md(block)
                         if pending_br_merge:
