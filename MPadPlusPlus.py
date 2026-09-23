@@ -21,7 +21,8 @@ from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListF
                            QSyntaxHighlighter, QTextTableFormat, QTextLength, QTextFrameFormat,
                            QDesktopServices, QPyTextObject, QMovie, QImage)
 from PySide6.QtCore import (QRegularExpression, Qt, QFileInfo, QPoint, QSize, QSizeF, QRect, QRectF,
-                            QTimer, QObject, QThread, Signal, QUrl, QBuffer, QByteArray, QIODevice)
+                            QTimer, QObject, QThread, Signal, QUrl, QBuffer, QByteArray, QIODevice,
+                            QMimeData)
 
 try:
     from PySide6.QtSvg import QSvgRenderer
@@ -3364,6 +3365,21 @@ class Editor(QTextEdit):
         finally:
             self.spell_highlighter.end_bulk_load()
 
+    def paste_plain_text(self):
+        """Ctrl+Shift+V: paste the clipboard as plain text, dropping any
+        rich formatting (HTML/RTF/images) that may be on the clipboard.
+        Goes through insertFromMimeData() with a text-only mime object so
+        the paste still gets the same bulk-load wrapping as a normal paste."""
+        if self.isReadOnly():
+            return
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        mime = QMimeData()
+        mime.setText(text)
+        self.insertFromMimeData(mime)
+        self.ensureCursorVisible()
+
     def post_process_markdown(self):
         cursor = QTextCursor(self.document())
         cursor.beginEditBlock()
@@ -4728,6 +4744,11 @@ class MainWindow(QMainWindow):
         paste_action.triggered.connect(self.edit_paste)
         edit_menu.addAction(paste_action)
 
+        paste_plain_action = QAction("Paste as Plain Text", self)
+        paste_plain_action.setShortcut(QKeySequence("Ctrl+Shift+V"))
+        paste_plain_action.triggered.connect(self.edit_paste_plain)
+        edit_menu.addAction(paste_plain_action)
+
         edit_menu.addSeparator()
 
         find_replace_action = QAction("Find && Replace", self)
@@ -5688,6 +5709,11 @@ class MainWindow(QMainWindow):
         editor = self.get_editor()
         if editor:
             editor.paste()
+
+    def edit_paste_plain(self):
+        editor = self.get_editor()
+        if editor:
+            editor.paste_plain_text()
 
     def toggle_bold(self):
         editor = self.get_editor()
