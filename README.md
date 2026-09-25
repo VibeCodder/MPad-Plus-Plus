@@ -1,5 +1,5 @@
 # MPad++
-It's a notepad app supporting Markdown commands.
+A Claude made notepad app supporting Markdown commands.
 
 <br>
 
