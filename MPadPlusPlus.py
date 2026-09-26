@@ -163,6 +163,16 @@ DEFAULT_SETTINGS = {
     "spellcheck_langs": ["pl_PL"],
     "spellcheck_custom_words": [],
 
+    # How the main window should appear on launch. One of: "maximized",
+    # "minimized", "last" (restore whatever state it was in when the app
+    # was last closed). See Settings > Preferences > General and
+    # MainWindow.apply_startup_window_state()/closeEvent().
+    "startup_window_mode": "last",
+    # Window state captured automatically in closeEvent() every time the
+    # app is closed - "normal", "maximized" or "minimized". Only read back
+    # when startup_window_mode is "last"; never edited by hand.
+    "last_window_state": "normal",
+
     # Minimum display width (px) for embedded media objects, per type.
     # A media object is never rendered narrower than this, even if its
     # natural (or scaled) size would otherwise be smaller - height follows
@@ -390,6 +400,24 @@ def make_svg_icon(name, color, size=18):
     renderer.render(painter)
     painter.end()
     return QIcon(pixmap)
+
+
+_APP_ICON = None
+
+def get_app_icon():
+    """Loads icons/notepad_yellow_icon.ico from the folder the *script itself*
+    lives in - not the current working directory, which can differ depending
+    on how the app was launched (double-click, shortcut, `python
+    /some/path/MPadPlusPlus.py`, ...) and would otherwise make the icon
+    silently fail to load. Cached after the first call and reused everywhere,
+    so the main window, every dialog, and the taskbar/app icon all
+    automatically show the exact same icon from a single source of truth."""
+    global _APP_ICON
+    if _APP_ICON is None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(script_dir, "icons", "notepad_yellow_icon.ico")
+        _APP_ICON = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
+    return _APP_ICON
 
 class _MediaDownloadThread(QThread):
     """Downloads a remote image/gif (http:// or https://) off the UI
@@ -3854,6 +3882,7 @@ class EditorTabs(QTabWidget):
 class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.settings = settings.copy()
         self.setWindowTitle("Style Configuration - MPad++")
         self.setMinimumWidth(450)
@@ -3997,6 +4026,7 @@ class SettingsDialog(QDialog):
 class PreferencesDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.settings = settings.copy()
         self.setWindowTitle("Preferences - MPad++")
         self.setMinimumWidth(400)
@@ -4070,6 +4100,31 @@ class PreferencesDialog(QDialog):
             min_size_layout.addRow(row_label, spin)
 
         layout.addRow("Minimum media size:", min_size_widget)
+
+        # How the main window should appear the next time the app is
+        # launched - mirrors the "New line (character)" radio group above.
+        startup_widget = QWidget()
+        startup_layout = QVBoxLayout(startup_widget)
+        startup_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.startup_window_group = QButtonGroup(startup_widget)
+        self.startup_window_radios = {}
+
+        startup_window_options = [
+            ("maximized", "Maximized window"),
+            ("minimized", "Minimized window"),
+            ("last", "Last closed"),
+        ]
+        current_startup_mode = self.settings.get("startup_window_mode", "last")
+        for value, label_text in startup_window_options:
+            radio = QRadioButton(label_text)
+            if value == current_startup_mode:
+                radio.setChecked(True)
+            self.startup_window_group.addButton(radio)
+            self.startup_window_radios[value] = radio
+            startup_layout.addWidget(radio)
+
+        layout.addRow("Open app in:", startup_widget)
 
         self.tabs.addTab(general_tab, "General")
 
@@ -4180,6 +4235,11 @@ class PreferencesDialog(QDialog):
 
         self.settings["table_default_align"] = self.table_default_align_combo.currentData()
 
+        for value, radio in self.startup_window_radios.items():
+            if radio.isChecked():
+                self.settings["startup_window_mode"] = value
+                break
+
         for media_key, spin in self.media_min_width_spins.items():
             self.settings[f"media_min_width_{media_key}"] = spin.value()
 
@@ -4199,6 +4259,7 @@ class PreferencesDialog(QDialog):
 class LinkDialog(QDialog):
     def __init__(self, selected_text, selected_url="https://", parent=None, allow_remove=False):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.setWindowTitle("Hyperlink - MPad++")
         # Wide and tall enough that a normal (or long) URL/display text is
         # fully visible - wrapped across a couple of lines - instead of
@@ -4298,6 +4359,7 @@ class MediaDialog(QDialog):
 
     def __init__(self, alt_text="", src="", parent=None, allow_remove=False):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.setWindowTitle("Multimedia - MPad++")
         self.setMinimumWidth(640)
         self.setMinimumHeight(360)
@@ -4386,6 +4448,7 @@ class MediaDialog(QDialog):
 class TableDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.setWindowTitle("Insert Table - MPad++")
         layout = QFormLayout(self)
 
@@ -4412,6 +4475,7 @@ class TableDialog(QDialog):
 class FindReplaceDialog(QDialog):
     def __init__(self, main_window):
         super().__init__(main_window)
+        self.setWindowIcon(get_app_icon())
         self.main_window = main_window
         self.setWindowTitle("Find & Replace - MPad++")
         self.setMinimumWidth(380)
@@ -4618,9 +4682,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("MPad++")
         self.resize(800, 600)
         
-        icon_path = os.path.join("icons", "notepad_yellow_icon.ico")
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+        self.setWindowIcon(get_app_icon())
 
         self.settings_file = "mpad_settings.json"
         self.settings = self.load_settings()
@@ -4661,6 +4723,25 @@ class MainWindow(QMainWindow):
         self.create_shortcuts()
         
         self.new_tab()
+
+    def apply_startup_window_state(self):
+        """Shows the window in the state chosen under Settings > Preferences
+        > General > "Open app in": always maximized, always minimized, or
+        whatever state it was in when the app was last closed (tracked
+        automatically in closeEvent(), see "last_window_state")."""
+        mode = self.settings.get("startup_window_mode", "last")
+        if mode == "maximized":
+            self.showMaximized()
+        elif mode == "minimized":
+            self.showMinimized()
+        else:  # "last"
+            last_state = self.settings.get("last_window_state", "normal")
+            if last_state == "maximized":
+                self.showMaximized()
+            elif last_state == "minimized":
+                self.showMinimized()
+            else:
+                self.show()
 
     def load_settings(self):
         if os.path.exists(self.settings_file):
@@ -5689,6 +5770,16 @@ class MainWindow(QMainWindow):
             if editor:
                 editor.release_media_players()
         self.spell_manager.shutdown()
+
+        # Remember how the window was left, for "Open app in: Last closed".
+        if self.isMaximized():
+            self.settings["last_window_state"] = "maximized"
+        elif self.isMinimized():
+            self.settings["last_window_state"] = "minimized"
+        else:
+            self.settings["last_window_state"] = "normal"
+        self.save_settings()
+
         event.accept()
 
     # --- WYSIWYG Formatting ---
@@ -6882,12 +6973,10 @@ if __name__ == "__main__":
     # Windows can re-sync style hints from the system theme later on.
     app.setCursorFlashTime(0)
 
-    icon_path = os.path.join("icons", "notepad_yellow_icon.ico")
-    if os.path.exists(icon_path):
-        app.setWindowIcon(QIcon(icon_path))
-        
+    app.setWindowIcon(get_app_icon())
+
     window = MainWindow()
-    window.show()
+    window.apply_startup_window_state()
 
     # Support `python MPadPlusPlus.py file1.md file2.md ...` - anything
     # after the script name (skipping option-like "-x" flags) is treated
