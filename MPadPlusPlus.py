@@ -437,9 +437,23 @@ def get_app_icon():
     automatically show the exact same icon from a single source of truth."""
     global _APP_ICON
     if _APP_ICON is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(script_dir, "icons", "notepad_yellow_icon.ico")
-        _APP_ICON = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
+        # Search every place the icon can live: inside a PyInstaller bundle
+        # (--add-data "icons;icons" unpacks to sys._MEIPASS), next to the
+        # built .exe (a --onefile exe runs from a temp folder, so
+        # __file__ does NOT point at the folder the exe sits in), and
+        # next to the script when run as plain Python.
+        search_dirs = []
+        if getattr(sys, "_MEIPASS", None):
+            search_dirs.append(sys._MEIPASS)
+        if getattr(sys, "frozen", False):
+            search_dirs.append(os.path.dirname(os.path.abspath(sys.executable)))
+        search_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+        _APP_ICON = QIcon()
+        for d in search_dirs:
+            icon_path = os.path.join(d, "icons", "notepad_yellow_icon.ico")
+            if os.path.exists(icon_path):
+                _APP_ICON = QIcon(icon_path)
+                break
     return _APP_ICON
 
 class _MediaDownloadThread(QThread):
@@ -7073,6 +7087,15 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    # Windows groups taskbar buttons by AppUserModelID; without an explicit
+    # one a script run through python.exe shows Python's icon on the taskbar.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MPadPlusPlus.App")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
 
     # Set this as early as possible, before any Editor/QTextEdit is
