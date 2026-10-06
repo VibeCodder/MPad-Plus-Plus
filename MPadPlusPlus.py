@@ -158,6 +158,10 @@ DEFAULT_SETTINGS = {
     # (two trailing spaces + newline), "backslash" (\ + newline).
     "line_break_style": "double_space",
 
+    # Edit > Word Wrap. When on, long lines (including lines inside code
+    # blocks) wrap at the editor's width instead of scrolling sideways.
+    "word_wrap": True,
+
     # Spell checking
     "spellcheck_enabled": False,
     "spellcheck_langs": ["pl_PL"],
@@ -269,6 +273,27 @@ def resolve_media_path(src, base_dir):
     return path, False
 
 
+_MD_FENCE_OPEN_RE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$')
+
+
+def md_fence_step(line, state):
+    """CommonMark-correct fenced-code tracking. `state` is None (outside a
+    fence) or (char, length) of the currently open fence. Returns
+    (new_state, is_fence_line). A closing fence must use the same char,
+    be at least as long as the opener and carry nothing but whitespace
+    after it - so a line like "```<br>" inside a block is plain content."""
+    if state:
+        ch, n = state
+        m = re.match(r'^ {0,3}(' + re.escape(ch) + r'{%d,})[ \t]*$' % n, line)
+        if m:
+            return None, True
+        return state, False
+    m = _MD_FENCE_OPEN_RE.match(line)
+    if m and not (m.group(1)[0] == '`' and '`' in m.group(2)):
+        return (m.group(1)[0], len(m.group(1))), True
+    return None, False
+
+
 _MD_IMAGE_SYNTAX_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 
 
@@ -280,13 +305,11 @@ def extract_media_alt_map(content):
     this is the only way to recover it, matched back up by position right
     after setMarkdown() runs (see Editor.replace_media_placeholders)."""
     results = []
-    in_code_block = False
+    fence_state = None
     for line in content.split('\n'):
-        stripped = line.lstrip()
-        if stripped.startswith('```'):
-            in_code_block = not in_code_block
-            continue
-        if in_code_block:
+        was_in_fence = fence_state is not None
+        fence_state, is_fence_line = md_fence_step(line, fence_state)
+        if is_fence_line or was_in_fence:
             continue
         for m in _MD_IMAGE_SYNTAX_RE.finditer(line):
             alt, src = m.group(1), m.group(2).strip()
@@ -1695,7 +1718,29 @@ class Editor(QTextEdit):
         self._caret_visible = False
         self.viewport().repaint()
 
+    def apply_word_wrap(self):
+        """Apply the Edit > Word Wrap setting to this editor. Qt's Markdown
+        importer marks fenced-code blocks as non-breakable, so after a
+        setMarkdown() (File > Open, Plain -> Formatted switch) their long
+        lines would not wrap even though pasted/typed code blocks do. The
+        per-block flag is therefore normalized here as well."""
+        wrap = bool(self.settings.get("word_wrap", True))
+        self.setLineWrapMode(QTextEdit.WidgetWidth if wrap else QTextEdit.NoWrap)
+        if wrap:
+            cursor = QTextCursor(self.document())
+            cursor.beginEditBlock()
+            block = self.document().firstBlock()
+            while block.isValid():
+                fmt = block.blockFormat()
+                if fmt.nonBreakableLines():
+                    fmt.setNonBreakableLines(False)
+                    QTextCursor(block).setBlockFormat(fmt)
+                block = block.next()
+            cursor.endEditBlock()
+        self.viewport().update()
+
     def apply_settings(self):
+        self.apply_word_wrap()
         self.setStyleSheet(f"QTextEdit {{ background-color: {self.settings['editor_bg']}; color: {self.settings['editor_text']}; border: none; }}")
         font = QFont(self.settings["font_family"], self.settings["font_size"])
         self.setFont(font)
@@ -3550,8 +3595,31 @@ class Editor(QTextEdit):
                         temp_cursor.setBlockFormat(block_fmt)
                 
             block = next_block
-            
+
+        # Empty lines right after a code block are exported as "<br>"s on
+        # their own line (a closing fence can't carry them). Qt reads such
+        # a line back as ONE block holding N line separators (N+1 visual
+        # lines), not as N empty blocks - turn it back into N empty blocks.
+        block = self.document().firstBlock()
+        while block.isValid():
+            prev = block.previous()
+            txt = block.text()
+            if (prev.isValid() and txt and set(txt) == {"\u2028"}
+                    and prev.blockFormat().hasProperty(BLOCK_CODE_PROP)
+                    and prev.blockFormat().property(BLOCK_CODE_PROP) == True
+                    and not QTextCursor(block).currentTable()):
+                n = len(txt)
+                c = QTextCursor(block)
+                c.movePosition(QTextCursor.StartOfBlock)
+                c.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+                c.removeSelectedText()
+                for _ in range(n - 1):
+                    c.insertBlock()
+                block = c.block()
+            block = block.next()
+
         cursor.endEditBlock()
+        self.apply_word_wrap()
         
     def apply_settings_to_document(self, restore_cursor=True):
         orig_cursor = self.textCursor()
@@ -4837,6 +4905,14 @@ class MainWindow(QMainWindow):
         find_replace_action.triggered.connect(self.open_find_replace)
         edit_menu.addAction(find_replace_action)
 
+        edit_menu.addSeparator()
+
+        self.act_word_wrap = QAction("Word Wrap", self)
+        self.act_word_wrap.setCheckable(True)
+        self.act_word_wrap.setChecked(bool(self.settings.get("word_wrap", True)))
+        self.act_word_wrap.toggled.connect(self.set_word_wrap)
+        edit_menu.addAction(self.act_word_wrap)
+
         view_menu = menubar.addMenu("View")
         self.view_action_group = QActionGroup(self)
         self.view_action_group.setExclusive(True)
@@ -5149,7 +5225,27 @@ class MainWindow(QMainWindow):
         
         md_lines = []
         in_code_block = False
+        fence = "```"
+        # Index of the md_lines entry that is the closing fence. Nothing
+        # may be glued onto it (e.g. a "<br>" for a following empty
+        # block), or it stops being a valid closing fence.
+        fence_close_idx = -1
         prev_was_quote = False
+
+        def pick_fence(start_block):
+            # Fence must be longer than any backtick run opening a line
+            # of the code content, otherwise that line ends the block.
+            longest = 0
+            b = start_block
+            while b.isValid():
+                bf = b.blockFormat()
+                if not (bf.hasProperty(BLOCK_CODE_PROP) and bf.property(BLOCK_CODE_PROP) == True):
+                    break
+                m = re.match(r'\s*(`+)', b.text())
+                if m:
+                    longest = max(longest, len(m.group(1)))
+                b = b.next()
+            return "`" * max(3, longest + 1)
         # When the "<br>" line-break style bridges two adjacent plain
         # paragraphs, the next block's text must be appended onto the
         # SAME md_lines entry (no extra raw "\n" in between) - see the
@@ -5305,7 +5401,8 @@ class MainWindow(QMainWindow):
             if is_hr:
                 pending_br_merge = False
                 if in_code_block:
-                    md_lines.append("```")
+                    md_lines.append(fence)
+                    fence_close_idx = len(md_lines) - 1
                     in_code_block = False
                 # A bare "---" only reads back as a thematic break (rather
                 # than a Setext heading underline for whatever text came
@@ -5320,14 +5417,16 @@ class MainWindow(QMainWindow):
             if is_block_code:
                 pending_br_merge = False
                 if not in_code_block:
-                    md_lines.append("```")
+                    fence = pick_fence(block)
+                    md_lines.append(fence)
                     in_code_block = True
                 md_lines.append(text)
                 block = block.next()
                 continue
             else:
                 if in_code_block:
-                    md_lines.append("```")
+                    md_lines.append(fence)
+                    fence_close_idx = len(md_lines) - 1
                     in_code_block = False
                     
             if level > 0:
@@ -5356,8 +5455,14 @@ class MainWindow(QMainWindow):
                 else:
                     if text == "":
                         pending_br_merge = False
-                        if md_lines:
+                        if md_lines and len(md_lines) - 1 != fence_close_idx:
                             md_lines[-1] += "<br>"
+                        elif md_lines:
+                            # previous line is a closing fence: keep it
+                            # intact, put the break on its own line
+                            ensure_blank_separator()
+                            md_lines.append("<br>")
+                            pending_blank_leading = True
                         else:
                             md_lines.append("<br>")
                             pending_blank_leading = True
@@ -5381,7 +5486,7 @@ class MainWindow(QMainWindow):
             block = block.next()
             
         if in_code_block:
-            md_lines.append("```")
+            md_lines.append(fence)
             
         return "\n".join(md_lines)
 
@@ -5538,19 +5643,15 @@ class MainWindow(QMainWindow):
         lines = content.split('\n')
         new_lines = []
         prev_type = 'normal'
-        in_md_code_block = False
+        fence_state = None
 
         for line in lines:
             stripped = line.lstrip()
 
-            if in_md_code_block:
-                if stripped.startswith('```'):
-                    in_md_code_block = False
-                    new_lines.append(line)
-                    prev_type = 'code'
-                else:
-                    new_lines.append(line)
-                    prev_type = 'code'
+            if fence_state:
+                fence_state, _ = md_fence_step(line, fence_state)
+                new_lines.append(line)
+                prev_type = 'code'
                 continue
 
             # Normalize the recognized hard-line-break tag before Qt's
@@ -5577,9 +5678,9 @@ class MainWindow(QMainWindow):
             line = re.sub(r'\\?<br\s*/?\\?>', '<br/>', line)
             stripped = line.lstrip()
 
-            if stripped.startswith('```'):
+            fence_state, is_fence_line = md_fence_step(line, None)
+            if is_fence_line:
                 current_type = 'code'
-                in_md_code_block = True
             elif stripped.startswith('> '):
                 current_type = 'quote'
             elif stripped.startswith('#'):
@@ -6905,6 +7006,14 @@ class MainWindow(QMainWindow):
             ed._reset_caret_blink()
             ed.line_number_area.update()
         QTimer.singleShot(0, _finish_view_switch)
+
+    def set_word_wrap(self, enabled):
+        self.settings["word_wrap"] = bool(enabled)
+        self.save_settings()
+        for i in range(self.tab_widget.count()):
+            ed = self.tab_widget.widget(i)
+            if hasattr(ed, "apply_word_wrap"):
+                ed.apply_word_wrap()
 
     def open_find_replace(self):
         if self.find_dialog is None:
