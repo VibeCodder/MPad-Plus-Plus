@@ -109,6 +109,42 @@ SPELLCHECK_WORD_CHAR_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 SPELLCHECK_LARGE_BLOCK_CHARS = 200
 
 
+def get_global_settings_path():
+    """Returns the absolute path of the global settings file (one per user,
+    independent of the current working directory or of the folder of the
+    opened .md file), creating the containing folder if needed:
+      Windows: %APPDATA%\\MPadPlusPlus\\mpad_settings.json
+      macOS:   ~/Library/Application Support/MPadPlusPlus/mpad_settings.json
+      Linux:   $XDG_CONFIG_HOME (or ~/.config)/MPadPlusPlus/mpad_settings.json
+    Falls back to the folder of the executable/script if the user config
+    folder is not writable."""
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    folder = os.path.join(base, "MPadPlusPlus")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        if getattr(sys, "frozen", False):
+            folder = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            folder = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(folder, "mpad_settings.json")
+
+
+def _legacy_settings_path():
+    """Old location (next to the executable/script), used only to migrate
+    existing settings into the global location on first run."""
+    if getattr(sys, "frozen", False):
+        folder = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        folder = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(folder, "mpad_settings.json")
+
+
 # --- Default settings ---
 DEFAULT_SETTINGS = {
     "app_bg": "#1e1e1e",
@@ -4208,6 +4244,13 @@ class PreferencesDialog(QDialog):
 
         layout.addRow("Open app in:", startup_widget)
 
+        # Opens the folder holding the global settings file
+        # (see get_global_settings_path) in the system file manager.
+        open_settings_folder_btn = QPushButton("Open global settings folder")
+        open_settings_folder_btn.setToolTip(get_global_settings_path())
+        open_settings_folder_btn.clicked.connect(self.open_global_settings_folder)
+        layout.addRow("Settings location:", open_settings_folder_btn)
+
         self.tabs.addTab(general_tab, "General")
 
         # --- Spell Check tab ---
@@ -4333,6 +4376,16 @@ class PreferencesDialog(QDialog):
             self.custom_words_list.item(i).text().lower() for i in range(self.custom_words_list.count())
         )
         super().accept()
+
+    def open_global_settings_folder(self):
+        folder = os.path.dirname(get_global_settings_path())
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError:
+            pass
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(folder)):
+            QMessageBox.warning(self, "Open folder",
+                                f"Could not open the folder:\n{folder}")
 
     def get_settings(self):
         return self.settings
@@ -4766,7 +4819,7 @@ class MainWindow(QMainWindow):
         
         self.setWindowIcon(get_app_icon())
 
-        self.settings_file = "mpad_settings.json"
+        self.settings_file = get_global_settings_path()
         self.settings = self.load_settings()
 
         self.spell_manager = SpellCheckManager(self.settings, self)
@@ -4826,20 +4879,30 @@ class MainWindow(QMainWindow):
                 self.show()
 
     def load_settings(self):
-        if os.path.exists(self.settings_file):
+        path = self.settings_file
+        if not os.path.exists(path):
+            # One-time migration of settings stored next to the executable.
+            legacy = _legacy_settings_path()
+            if os.path.exists(legacy) and os.path.abspath(legacy) != os.path.abspath(path):
+                path = legacy
+        if os.path.exists(path):
             try:
-                with open(self.settings_file, 'r', encoding='utf-8') as f:
+                with open(path, 'r', encoding='utf-8') as f:
                     saved_settings = json.load(f)
                     defaults = DEFAULT_SETTINGS.copy()
                     defaults.update(saved_settings)
                     return defaults
-            except:
+            except Exception:
                 pass
         return DEFAULT_SETTINGS.copy()
 
     def save_settings(self):
-        with open(self.settings_file, 'w', encoding='utf-8') as f:
-            json.dump(self.settings, f, indent=4)
+        try:
+            os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(self.settings, f, indent=4)
+        except OSError:
+            pass
 
     def apply_app_theme(self):
         self.setStyleSheet(f"""
