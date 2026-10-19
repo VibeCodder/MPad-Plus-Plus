@@ -147,11 +147,11 @@ def _legacy_settings_path():
 
 # --- Default settings ---
 DEFAULT_SETTINGS = {
-    "app_bg": "#1e1e1e",
+    "app_bg": "#272727",
     "app_text": "#d4d4d4",
-    "editor_bg": "#1e1e1e",
+    "editor_bg": "#2d2d2d",
     "editor_text": "#d4d4d4",
-    "current_line_highlight": "#2a2a2a",
+    "current_line_highlight": "#3a3a3a",
     "font_family": "Consolas",
     "font_size": 12,
     
@@ -185,8 +185,8 @@ DEFAULT_SETTINGS = {
     # user had picked it per-column from Edit Table right after creating it.
     "table_default_align": "left",
     
-    "tab_active_bg": "#1e1e1e",
-    "tab_inactive_bg": "#2d2d2d",
+    "tab_active_bg": "#2d2d2d",
+    "tab_inactive_bg": "#1e1e1e",
     "tab_active_bar_color": "#007acc",
 
     # How a Shift+Enter soft line break (within the same paragraph) is
@@ -4912,12 +4912,12 @@ class MainWindow(QMainWindow):
             QTabBar::tab {{ background: {self.settings['tab_inactive_bg']}; color: #888; padding: 5px 12px 8px 12px; border: 1px solid #1e1e1e; border-top: 3px solid transparent; }}
             QTabBar::tab:selected {{ background: {self.settings['tab_active_bg']}; color: {self.settings['app_text']}; border-bottom: none; border-top: 3px solid {self.settings['tab_active_bar_color']}; }}
             QTabBar::tab:hover:!selected {{ background: #383838; }}
-            QToolBar {{ background-color: #2d2d2d; border: none; spacing: 2px; }}
+            QToolBar {{ background-color: {self.settings['app_bg']}; border: none; spacing: 2px; }}
             QToolButton {{ background-color: #3e3e42; color: {self.settings['app_text']}; border: 1px solid #555; padding: 5px; border-radius: 3px; }}
             QToolButton:hover {{ background-color: #505050; }}
             QToolButton:checked {{ background-color: #007acc; border: 1px solid #007acc; }}
             QStatusBar {{ background-color: #2d2d2d; color: #ccc; }}
-            QMenuBar {{ background-color: #2d2d2d; color: {self.settings['app_text']}; }}
+            QMenuBar {{ background-color: {self.settings['app_bg']}; color: {self.settings['app_text']}; }}
             QMenuBar::item:selected {{ background-color: #505050; }}
             QMenu {{ background-color: #2d2d2d; color: {self.settings['app_text']}; border: 1px solid #555; }}
             QMenu::item:selected {{ background-color: #505050; }}
@@ -5716,7 +5716,39 @@ class MainWindow(QMainWindow):
         return text
 
     # --- File Operations ---
+    def isolate_structural_lines(self, content):
+        """Make block boundaries explicit so the importer never depends on
+        the user having typed blank lines. A fenced code block always gets
+        a blank line before its opening fence and after its closing fence,
+        and a lone '<br>' line (which CommonMark reads as an HTML block
+        that swallows every following line up to the next blank line,
+        including fences) is closed off with a blank line too. Fence
+        content is never touched."""
+        out = []
+        fence_state = None
+        after_close = False
+        lone_br_re = re.compile(r'^\s*\\?<br\s*/?\\?>\s*$')
+        prev_lone_br = False
+        for line in content.split('\n'):
+            if fence_state:
+                fence_state, _ = md_fence_step(line, fence_state)
+                out.append(line)
+                if fence_state is None:
+                    after_close = True
+                continue
+            new_state, is_open = md_fence_step(line, None)
+            blank = line.strip() == ''
+            if out and out[-1].strip() != '':
+                if is_open or ((after_close or prev_lone_br) and not blank):
+                    out.append('')
+            after_close = False
+            prev_lone_br = bool(lone_br_re.match(line))
+            out.append(line)
+            fence_state = new_state
+        return '\n'.join(out)
+
     def preprocess_markdown(self, content):
+        content = self.isolate_structural_lines(content)
         lines = content.split('\n')
         new_lines = []
         prev_type = 'normal'
