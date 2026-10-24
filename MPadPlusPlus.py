@@ -3,10 +3,11 @@ import json
 import os
 import re
 import uuid
+import unicodedata
 import webbrowser
 import urllib.request
 from collections import deque
-from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QVBoxLayout, 
+from PySide6.QtWidgets import (QApplication, QFrame, QMainWindow, QTextEdit, QVBoxLayout, 
                                QHBoxLayout, QWidget, QToolBar, QDialog, 
                                QLabel, QLineEdit, QDialogButtonBox, QColorDialog, 
                                QPushButton, QFormLayout, QSpinBox, QFontDialog, 
@@ -21,7 +22,7 @@ from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListF
                            QSyntaxHighlighter, QTextTableFormat, QTextLength, QTextFrameFormat,
                            QDesktopServices, QPyTextObject, QMovie, QImage)
 from PySide6.QtCore import (QRegularExpression, Qt, QFileInfo, QPoint, QSize, QSizeF, QRect, QRectF,
-                            QTimer, QObject, QThread, Signal, QUrl, QBuffer, QByteArray, QIODevice,
+                            QTimer, QObject, QThread, Signal, QUrl, QBuffer, QPointF, QByteArray, QIODevice,
                             QMimeData)
 
 try:
@@ -171,6 +172,19 @@ DEFAULT_SETTINGS = {
 
     "hr_color": "#5c5c5c",
     "hr_thickness": 2,
+
+    # Find & Replace: ENTER replaces (instead of just finding the next match).
+    "find_enter_replaces": False,
+
+    # Gap (px) between an underlined heading's text and its line.
+    "setext_line_gap": 8,
+
+    # Underlined headings (Title over === / ---): their own text style and
+    # the line drawn under them. Buttons H1_ / H2_.
+    "h1u": "#569cd6", "h1u_size": 24,
+    "h2u": "#569cd6", "h2u_size": 20,
+    "h1u_line_color": "#3d444d", "h1u_line_thickness": 1,
+    "h2u_line_color": "#3d444d", "h2u_line_thickness": 1,
     "link": "#3794ff", "link_size": 0,
     "link_underline": True,
     
@@ -188,11 +202,6 @@ DEFAULT_SETTINGS = {
     "tab_active_bg": "#2d2d2d",
     "tab_inactive_bg": "#1e1e1e",
     "tab_active_bar_color": "#007acc",
-
-    # How a Shift+Enter soft line break (within the same paragraph) is
-    # written to Markdown on save. One of: "br" (<br/>), "double_space"
-    # (two trailing spaces + newline), "backslash" (\ + newline).
-    "line_break_style": "double_space",
 
     # Edit > Word Wrap. When on, long lines (including lines inside code
     # blocks) wrap at the editor's width instead of scrolling sideways.
@@ -227,6 +236,16 @@ CODE_PROP = QTextFormat.UserProperty + 1
 QUOTE_PROP = QTextFormat.UserProperty + 2
 BLOCK_CODE_PROP = QTextFormat.UserProperty + 3
 HR_PROP = QTextFormat.UserProperty + 4
+
+# Code-block padding. Qt paints a block's background only INSIDE its margins,
+# so the dark box is painted by Editor.paintEvent (padded rectangle behind the
+# whole run of code lines) and the margins below keep the text away from the
+# edges. CODE_PAD_PROP marks blocks that currently carry these margins so they
+# can be cleaned up when a block stops being code.
+CODE_PAD_PROP = QTextFormat.UserProperty + 7
+CODE_PAD_X = 10          # left padding (px)
+CODE_PAD_Y = 6           # top padding of the first line / bottom padding of the last line (px)
+CODE_PAD_RIGHT = 30      # right margin: keeps text (it wraps there) clear of the "Copy" button
 
 # --- Embedded media (images / gifs / video / audio) ---
 # Rendered as a single custom QTextObjectInterface object (a "media object")
@@ -329,29 +348,6 @@ def md_fence_step(line, state):
         return (m.group(1)[0], len(m.group(1))), True
     return None, False
 
-
-_MD_IMAGE_SYNTAX_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
-
-
-def extract_media_alt_map(content):
-    """Scan raw Markdown source (outside fenced code blocks) for
-    ![alt](src) occurrences, in document order, and return them as a list
-    of (alt, src) tuples. Needed because Qt's own Markdown importer parses
-    this same syntax into an image but silently discards the alt text -
-    this is the only way to recover it, matched back up by position right
-    after setMarkdown() runs (see Editor.replace_media_placeholders)."""
-    results = []
-    fence_state = None
-    for line in content.split('\n'):
-        was_in_fence = fence_state is not None
-        fence_state, is_fence_line = md_fence_step(line, fence_state)
-        if is_fence_line or was_in_fence:
-            continue
-        for m in _MD_IMAGE_SYNTAX_RE.finditer(line):
-            alt, src = m.group(1), m.group(2).strip()
-            src = src.split(' ', 1)[0].strip('<>')  # drop an optional "title" and any <...> wrapping
-            results.append((alt, src))
-    return results
 
 # --- Toolbar icons ---
 # Simple, original monoline glyphs (20x20 viewBox). "{color}" is filled in
@@ -1539,72 +1535,974 @@ def sync_table_column_alignments(table):
         set_table_column_alignment(table, c, get_table_column_alignment(table, c))
 
 
-_TABLE_SEP_CELL_RE = re.compile(r'^:?-+:?$')
+# =====================================================================
+# Markdown engine
+# =====================================================================
+#
+# One self-contained implementation of everything the editor needs from
+# Markdown - parsing source text into a small block model, drawing that
+# model into a QTextDocument (Editor.load_markdown) and writing a
+# QTextDocument back out as Markdown (md_serialize). Qt's own Markdown
+# importer (QTextDocument.setMarkdown) is no longer involved at all, so
+# there is nothing to pre-process before it and nothing to repair after.
+#
+# The model is deliberately *line oriented*, like the editor itself:
+#
+#   * every source line is exactly one block (paragraph, heading, list
+#     item, quote line, table, code line, horizontal rule), and every
+#     empty source line is exactly one empty block - there is no separate
+#     "paragraph" notion that swallows or merges neighbouring lines;
+#   * a line break is ONE concept no matter how it is spelled: a real
+#     "\n", a "<br>" / "<br/>" / "<br />" tag (also the legacy "\<br/\>"
+#     form), a trailing backslash or two trailing spaces. A marker at the
+#     very end of a line is only a decoration of the "\n" that follows it
+#     (so "a<br>\nb" is two lines, not three); a marker in the middle of a
+#     line is a line break of its own ("a<br>b" is two lines);
+#   * markers inside inline code spans and fenced code blocks are plain
+#     text and never interpreted;
+#   * the only exception is a table cell, which cannot contain a real
+#     newline - there "<br>" is kept as an in-cell soft line break.
+#
+# Because import and export share this one model, a document survives
+# Plain text <-> Formatted switches and save/open cycles unchanged, with no
+# special cases for blank lines, code fences, tables or line-break tags.
+
+MD_LINE_SEP = "\u2028"   # Qt's in-block soft line break (Shift+Enter)
+CODE_LANG_PROP = QTextFormat.UserProperty + 5   # info string after the opening code fence
+SETEXT_PROP = QTextFormat.UserProperty + 6      # heading written underlined: Title / === (H1) or Title / --- (H2)
+_MD_SETEXT_RE = re.compile(r'^ {0,3}(={3,}|-{3,})[ \t]*$')
 
 
-def parse_markdown_table_alignments(source_text):
-    """Scan raw Markdown text for GFM table separator rows and return a list
-    of per-table column-alignment lists (one entry per table, in the order
-    the tables appear), e.g. [["left", "center", "right"], ...].
-
-    This exists because Qt's own Markdown importer (QTextDocument.setMarkdown)
-    parses the table itself but silently discards the alignment markers in
-    the process - so the only way to recover them is to read the source text
-    directly, then reapply them to the resulting QTextTable afterward.
-    """
-    lines = source_text.splitlines()
-
-    def split_row(line):
-        line = line.strip()
-        if line.startswith('|'):
-            line = line[1:]
-        if line.endswith('|'):
-            line = line[:-1]
-        return [c.strip() for c in line.split('|')]
-
-    tables_align = []
-    for i in range(1, len(lines)):
-        line = lines[i]
-        if '|' not in line:
-            continue
-        prev = lines[i - 1]
-        if '|' not in prev or not prev.strip():
-            continue
-        cells = split_row(line)
-        if not cells or not all(_TABLE_SEP_CELL_RE.match(c) for c in cells):
-            continue
-        aligns = []
-        for c in cells:
-            if c.startswith(':') and c.endswith(':'):
-                aligns.append("center")
-            elif c.endswith(':'):
-                aligns.append("right")
-            else:
-                aligns.append("left")
-        tables_align.append(aligns)
-    return tables_align
+def is_setext_block(bf):
+    """True for an H1/H2 block that is saved in the underlined form."""
+    return (bf.headingLevel() in (1, 2) and bf.hasProperty(SETEXT_PROP)
+            and bf.property(SETEXT_PROP) == True)
 
 
-def apply_markdown_table_alignments(document, tables_align):
-    """Reapply the per-table column alignments parse_markdown_table_alignments()
-    recovered from source text onto the QTextTables setMarkdown() just built,
-    matching them up in document order."""
-    if not tables_align:
-        return
-    cursor = QTextCursor(document)
-    cursor.movePosition(QTextCursor.Start)
-    idx = 0
-    while idx < len(tables_align):
-        table = cursor.currentTable()
-        if table:
-            aligns = tables_align[idx]
-            idx += 1
-            for c in range(min(table.columns(), len(aligns))):
-                set_table_column_alignment(table, c, aligns[c])
-            cursor.setPosition(table.lastPosition() + 1, QTextCursor.MoveAnchor)
+def heading_style_key(bf):
+    """Settings key prefix of a heading block: "h1".."h6", or "h1u"/"h2u"
+    for the underlined variants."""
+    level = bf.headingLevel()
+    return "h%du" % level if is_setext_block(bf) else "h%d" % level
+
+
+def setext_line_style(settings, level):
+    key = "h%du" % level
+    color = QColor(settings.get(key + "_line_color", DEFAULT_SETTINGS[key + "_line_color"]))
+    thickness = max(1, int(settings.get(key + "_line_thickness", DEFAULT_SETTINGS[key + "_line_thickness"])))
+    return color, thickness
+
+
+def setext_line_gap(settings):
+    return max(0, int(settings.get("setext_line_gap", DEFAULT_SETTINGS["setext_line_gap"])))
+
+
+def fit_setext_margin(bf, settings):
+    """Gives an underlined heading the room its line is drawn in (a bottom
+    margin) and takes it away from every other block's heading. Returns
+    True when `bf` was changed."""
+    if is_setext_block(bf):
+        want = setext_line_gap(settings) + setext_line_style(settings, bf.headingLevel())[1] + 10
+    elif bf.headingLevel() > 0:
+        want = 0
+    else:
+        return False
+    if abs(bf.bottomMargin() - want) < 0.01:
+        return False
+    bf.setBottomMargin(want)
+    return True
+
+_MD_ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+_MD_BR_RE = re.compile(r'\\?<br\s*/?\\?>', re.IGNORECASE)
+_MD_U_TAG_RE = re.compile(r'<(/?)u>', re.IGNORECASE)
+_MD_AUTOLINK_RE = re.compile(r'<((?:https?|ftp|mailto|file):[^\s<>]+)>', re.IGNORECASE)
+_MD_SPECIAL_RE = re.compile(r'[\\`<!\[*_]')
+_MD_TABLE_SEP_CELL_RE = re.compile(r'^:?-+:?$')
+_MD_HR_RE = re.compile(r'^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$')
+_MD_HEADING_RE = re.compile(r'^ {0,3}(#{1,6})(?:[ \t]+(.*))?$')
+_MD_QUOTE_RE = re.compile(r'^ {0,3}>[ ]?(.*)$')
+_MD_BULLET_RE = re.compile(r'^([ \t]*)[-*+\u2022]( +)(.*)$')
+_MD_NUMBERED_RE = re.compile(r'^([ \t]*)((?:\d+\.)*\d+)\.( +)(.*)$')
+_MD_TRAILING_BACKSLASH_RE = re.compile(r'(?<!\\)(?:\\\\)*\\$')
+_MD_EXPLICIT_EMPTY = "\x00"
+_MD_BULLET_OUT_RE = re.compile(r'^(\s*)([\u2022\-*])( +)')
+
+
+class MdSpan:
+    """A run of inline text with one uniform style. A span carrying
+    `media` (an (alt, src) tuple) stands for an embedded image/gif/video/
+    audio object instead of text."""
+    __slots__ = ("text", "bold", "italic", "underline", "code", "href", "media")
+
+    def __init__(self, text="", bold=False, italic=False, underline=False,
+                 code=False, href=None, media=None):
+        self.text = text
+        self.bold = bold
+        self.italic = italic
+        self.underline = underline
+        self.code = code
+        self.href = href
+        self.media = media
+
+    def style_key(self):
+        return (self.bold, self.italic, self.underline, self.code, self.href)
+
+
+# --- Inline parsing ---------------------------------------------------
+
+def _md_char_class(ch):
+    if not ch or ch.isspace():
+        return 'ws'
+    if unicodedata.category(ch)[0] in 'PS':
+        return 'punct'
+    return 'other'
+
+
+def _md_unescape(text):
+    """Backslash + ASCII punctuation -> the punctuation character alone."""
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] == '\\' and i + 1 < len(text) and text[i + 1] in _MD_ASCII_PUNCT:
+            out.append(text[i + 1])
+            i += 2
         else:
-            if not cursor.movePosition(QTextCursor.NextBlock):
+            out.append(text[i])
+            i += 1
+    return ''.join(out)
+
+
+def _md_match_code_span(text, i):
+    """text[i] is a backtick. Returns (content, end_index) when it opens a
+    code span closed by a backtick run of exactly the same length, else
+    None."""
+    n = len(text)
+    j = i
+    while j < n and text[j] == '`':
+        j += 1
+    run = j - i
+    k = j
+    while k < n:
+        if text[k] == '`':
+            e = k
+            while e < n and text[e] == '`':
+                e += 1
+            if e - k == run:
+                content = text[j:k].replace('\n', ' ')
+                if len(content) >= 2 and content[0] == ' ' and content[-1] == ' ' and content.strip(' '):
+                    content = content[1:-1]
+                return content, e
+            k = e
+        else:
+            k += 1
+    return None
+
+
+def _md_code_ranges(text):
+    """[(start, end)] of every code span in `text`."""
+    ranges = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == '`':
+            m = _md_match_code_span(text, i)
+            if m:
+                ranges.append((i, m[1]))
+                i = m[1]
+                continue
+            while i < n and text[i] == '`':
+                i += 1
+            continue
+        i += 1
+    return ranges
+
+
+def _md_find_bracket_end(text, i):
+    """text[i] == '['. Index of the matching ']' (nesting and escapes
+    respected, code spans skipped), or -1."""
+    depth = 0
+    j = i
+    n = len(text)
+    while j < n:
+        c = text[j]
+        if c == '\\':
+            j += 2
+            continue
+        if c == '`':
+            m = _md_match_code_span(text, j)
+            if m:
+                j = m[1]
+                continue
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def _md_parse_destination(text, k):
+    """text[k] == '('. Parses a link destination (+ optional title) and
+    returns (destination, index_after_closing_paren) or None.
+
+    A destination may be wrapped in <...> (then it can contain anything,
+    including spaces and parentheses) or written bare, in which case it
+    runs up to the balancing ')' and may therefore contain spaces - so
+    local Windows paths such as C:\\My Files\\clip.mp4 work unquoted.
+    Backslashes are NOT treated as escapes here: they are path separators.
+    """
+    n = len(text)
+    j = k + 1
+    while j < n and text[j] in ' \t':
+        j += 1
+    if j < n and text[j] == '<':
+        e = text.find('>', j + 1)
+        if e == -1:
+            return None
+        dest = text[j + 1:e]
+        m = re.match(r'\s*(?:"[^"]*"|\'[^\']*\')?\s*\)', text[e + 1:])
+        if not m:
+            return None
+        return dest, e + 1 + m.end()
+    depth = 0
+    start = j
+    while j < n:
+        c = text[j]
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            if depth == 0:
                 break
+            depth -= 1
+        j += 1
+    else:
+        return None
+    raw = text[start:j]
+    m = re.match(r'^(.*?)(?:\s+(?:"[^"]*"|\'[^\']*\'))?\s*$', raw, re.DOTALL)
+    return m.group(1).strip(), j + 1
+
+
+def _md_tokenize_inline(text):
+    nodes = []
+    buf = []
+
+    def flush():
+        if buf:
+            nodes.append({'t': 'text', 'text': ''.join(buf)})
+            buf.clear()
+
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c not in '\\`<![*_':
+            m = _MD_SPECIAL_RE.search(text, i)
+            j = m.start() if m else n
+            buf.append(text[i:j])
+            i = j
+            continue
+
+        if c == '\\':
+            m = _MD_BR_RE.match(text, i)          # legacy "\<br/\>"
+            if m:
+                flush()
+                nodes.append({'t': 'br'})
+                i = m.end()
+            elif i + 1 < n and text[i + 1] in _MD_ASCII_PUNCT:
+                buf.append(text[i + 1])
+                i += 2
+            else:
+                buf.append('\\')
+                i += 1
+            continue
+
+        if c == '`':
+            m = _md_match_code_span(text, i)
+            if m:
+                flush()
+                nodes.append({'t': 'code', 'text': m[0]})
+                i = m[1]
+            else:
+                j = i
+                while j < n and text[j] == '`':
+                    j += 1
+                buf.append(text[i:j])
+                i = j
+            continue
+
+        if c == '<':
+            m = _MD_BR_RE.match(text, i)
+            if m:
+                flush()
+                nodes.append({'t': 'br'})
+                i = m.end()
+                continue
+            m = _MD_U_TAG_RE.match(text, i)
+            if m:
+                flush()
+                nodes.append({'t': 'u', 'on': not m.group(1)})
+                i = m.end()
+                continue
+            m = _MD_AUTOLINK_RE.match(text, i)
+            if m:
+                flush()
+                nodes.append({'t': 'link', 'label': m.group(1), 'href': m.group(1)})
+                i = m.end()
+                continue
+            buf.append('<')
+            i += 1
+            continue
+
+        if c == '!' or c == '[':
+            is_image = (c == '!')
+            if is_image and not (i + 1 < n and text[i + 1] == '['):
+                buf.append('!')
+                i += 1
+                continue
+            lb = i + 1 if is_image else i
+            rb = _md_find_bracket_end(text, lb)
+            if rb != -1 and rb + 1 < n and text[rb + 1] == '(':
+                parsed = _md_parse_destination(text, rb + 1)
+                if parsed and parsed[0]:
+                    flush()
+                    label = text[lb + 1:rb]
+                    if is_image:
+                        nodes.append({'t': 'media', 'alt': _md_unescape(label), 'src': parsed[0]})
+                    else:
+                        nodes.append({'t': 'link', 'label': label, 'href': parsed[0]})
+                    i = parsed[1]
+                    continue
+            buf.append(c)
+            i += 1
+            continue
+
+        # '*' or '_' : a delimiter run, resolved into bold/italic later
+        j = i
+        while j < n and text[j] == c:
+            j += 1
+        count = j - i
+        before = _md_char_class(text[i - 1] if i > 0 else '')
+        after = _md_char_class(text[j] if j < n else '')
+        left = after != 'ws' and (after != 'punct' or before in ('ws', 'punct'))
+        right = before != 'ws' and (before != 'punct' or after in ('ws', 'punct'))
+        if c == '*':
+            can_open, can_close = left, right
+        else:
+            can_open = left and (not right or before == 'punct')
+            can_close = right and (not left or after == 'punct')
+        flush()
+        nodes.append({'t': 'delim', 'char': c, 'count': count, 'orig': count,
+                      'open': can_open, 'close': can_close})
+        i = j
+    flush()
+    return nodes
+
+
+def _md_resolve_emphasis(nodes):
+    """Pairs up '*'/'_' delimiter runs (CommonMark's delimiter-stack rules,
+    including the "rule of 3") and marks every node between a matched pair
+    as bold (2 delimiters) or italic (1). Unmatched delimiters stay literal
+    text."""
+    i = 0
+    while i < len(nodes):
+        closer = nodes[i]
+        if not (closer['t'] == 'delim' and closer['close'] and closer['count'] > 0):
+            i += 1
+            continue
+        found = -1
+        j = i - 1
+        while j >= 0:
+            o = nodes[j]
+            if (o['t'] == 'delim' and o['char'] == closer['char']
+                    and o['open'] and o['count'] > 0):
+                if ((o['close'] or closer['open'])
+                        and (o['orig'] + closer['orig']) % 3 == 0
+                        and not (o['orig'] % 3 == 0 and closer['orig'] % 3 == 0)):
+                    j -= 1
+                    continue
+                found = j
+                break
+            j -= 1
+        if found == -1:
+            i += 1
+            continue
+        opener = nodes[found]
+        use = 2 if (opener['count'] >= 2 and closer['count'] >= 2) else 1
+        opener['count'] -= use
+        closer['count'] -= use
+        key = 'bold' if use == 2 else 'italic'
+        for k in range(found + 1, i):
+            nodes[k][key] = True
+            if nodes[k]['t'] == 'delim':
+                nodes[k]['open'] = nodes[k]['close'] = False
+        if closer['count'] == 0:
+            i += 1
+
+
+def _md_merge_spans(spans):
+    out = []
+    for sp in spans:
+        if (out and sp.media is None and out[-1].media is None
+                and out[-1].style_key() == sp.style_key()):
+            out[-1].text += sp.text
+        else:
+            out.append(sp)
+    return out
+
+
+def md_parse_inline(text):
+    """Inline Markdown -> list of MdSpan."""
+    nodes = _md_tokenize_inline(text)
+    _md_resolve_emphasis(nodes)
+    spans = []
+    underline = False
+    for nd in nodes:
+        t = nd['t']
+        if t == 'u':
+            underline = nd['on']
+            continue
+        bold = nd.get('bold', False)
+        italic = nd.get('italic', False)
+        if t == 'text':
+            spans.append(MdSpan(nd['text'], bold, italic, underline))
+        elif t == 'delim':
+            if nd['count'] > 0:
+                spans.append(MdSpan(nd['char'] * nd['count'], bold, italic, underline))
+        elif t == 'br':
+            spans.append(MdSpan(MD_LINE_SEP, bold, italic, underline))
+        elif t == 'code':
+            spans.append(MdSpan(nd['text'], bold, italic, underline, code=True))
+        elif t == 'media':
+            spans.append(MdSpan(bold=bold, italic=italic, underline=underline,
+                                media=(nd['alt'], nd['src'])))
+        elif t == 'link':
+            for sp in md_parse_inline(nd['label']):
+                if sp.href is None:
+                    sp.href = nd['href']
+                sp.bold = sp.bold or bold
+                sp.italic = sp.italic or italic
+                sp.underline = sp.underline or underline
+                spans.append(sp)
+    return _md_merge_spans(spans)
+
+
+# --- Line breaks ------------------------------------------------------
+
+def _md_split_breaks(line):
+    """Splits one source line at its line-break markers (see the header
+    comment). Returns the list of resulting lines - a list with a single
+    unchanged entry when the line holds no marker."""
+    ranges = _md_code_ranges(line)
+
+    def in_code(pos):
+        return any(a <= pos < b for a, b in ranges)
+
+    matches = [m for m in _MD_BR_RE.finditer(line) if not in_code(m.start())]
+
+    # One marker right at the end of the line only decorates its "\n".
+    if matches and not line[matches[-1].end():].strip(' \t'):
+        line = line[:matches[-1].start()]
+        matches.pop()
+    elif _MD_TRAILING_BACKSLASH_RE.search(line):
+        line = line[:-1]
+    elif line.endswith('  ') and line.strip():
+        line = line.rstrip(' ')
+
+    if not matches:
+        return [line]
+    parts = []
+    pos = 0
+    for m in matches:
+        parts.append(line[pos:m.start()])
+        pos = m.end()
+    parts.append(line[pos:])
+    return parts
+
+
+# --- Block parsing ----------------------------------------------------
+
+def _md_indent_depth(ws):
+    tabs = ws.count('\t')
+    spaces = len(ws) - tabs
+    return tabs + (spaces + 1) // 4
+
+
+def _md_split_table_row(line):
+    s = line.strip()
+    if s.startswith('|'):
+        s = s[1:]
+    cells = []
+    cur = []
+    i = 0
+    ended_with_pipe = False
+    while i < len(s):
+        c = s[i]
+        if c == '\\' and i + 1 < len(s):
+            cur.append(s[i:i + 2])
+            i += 2
+            ended_with_pipe = False
+            continue
+        if c == '|':
+            cells.append(''.join(cur))
+            cur = []
+            ended_with_pipe = True
+        else:
+            cur.append(c)
+            ended_with_pipe = False
+        i += 1
+    if not ended_with_pipe:
+        cells.append(''.join(cur))
+    return [c.strip().replace('\\|', '|') for c in cells]
+
+
+def _md_try_table(lines, i):
+    """If lines[i], lines[i+1] form a GFM table header + separator, returns
+    (block, next_index), else None."""
+    if i + 1 >= len(lines) or '|' not in lines[i] or '|' not in lines[i + 1]:
+        return None
+    header = _md_split_table_row(lines[i])
+    sep = _md_split_table_row(lines[i + 1])
+    if not header or len(header) != len(sep):
+        return None
+    if not all(_MD_TABLE_SEP_CELL_RE.match(c) for c in sep):
+        return None
+    aligns = []
+    for c in sep:
+        if c.startswith(':') and c.endswith(':'):
+            aligns.append("center")
+        elif c.endswith(':'):
+            aligns.append("right")
+        else:
+            aligns.append("left")
+    rows = []
+    j = i + 2
+    while j < len(lines) and lines[j].strip() and '|' in lines[j]:
+        cells = _md_split_table_row(lines[j])
+        cells = (cells + [''] * len(header))[:len(header)]
+        rows.append([md_parse_inline(c) for c in cells])
+        j += 1
+    block = {'kind': 'table', 'aligns': aligns,
+             'header': [md_parse_inline(c) for c in header], 'rows': rows}
+    return block, j
+
+
+def md_parse(source):
+    """Markdown source text -> list of block dicts:
+       {'kind': 'para',    'spans': [...]}
+       {'kind': 'heading', 'level': n, 'spans': [...]}
+       {'kind': 'quote',   'spans': [...]}
+       {'kind': 'list',    'prefix': '\\t2.1. ' | '• ', 'spans': [...]}
+       {'kind': 'hr'}
+       {'kind': 'code',    'lines': [...], 'info': '...'}
+       {'kind': 'table',   'aligns': [...], 'header': [...], 'rows': [[...]]}
+    The text is used exactly as given - a trailing newline is NOT dropped
+    here (callers reading a file strip the single newline that terminates
+    its last line)."""
+    if source.startswith('\ufeff'):
+        source = source[1:]
+    source = source.replace('\r\n', '\n').replace('\r', '\n')
+    lines = source.split('\n')
+    blocks = []
+    after_hr = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        pad_after_hr, after_hr = after_hr, False
+        state, is_open = md_fence_step(line, None)
+        if is_open:
+            info = _MD_FENCE_OPEN_RE.match(line).group(2).strip()
+            code = []
+            j = i + 1
+            while j < len(lines):
+                state, is_close = md_fence_step(lines[j], state)
+                if is_close:
+                    j += 1
+                    break
+                code.append(lines[j])
+                j += 1
+            blocks.append({'kind': 'code', 'lines': code or [''], 'info': info})
+            i = j
+            continue
+
+        table = _md_try_table(lines, i)
+        if table:
+            blocks.append(table[0])
+            i = table[1]
+            continue
+
+        parts = _md_split_breaks(line)
+        if len(parts) != 1 or parts[0] != line:
+            if _MD_QUOTE_RE.match(line):
+                parts = parts[:1] + ['> ' + p for p in parts[1:]]
+            # An empty line produced by a <br> is an explicit empty line,
+            # unlike a blank one in the file (see the horizontal-rule
+            # padding below), so it gets a sentinel.
+            lines[i:i + 1] = [p if p else _MD_EXPLICIT_EMPTY for p in parts]
+            continue
+
+        if line == _MD_EXPLICIT_EMPTY:
+            blocks.append({'kind': 'para', 'spans': []})
+        elif not line.strip():
+            if not pad_after_hr:       # (a blank line right after a rule is padding)
+                blocks.append({'kind': 'para', 'spans': [], 'blank': True})
+        elif _MD_HR_RE.match(line):
+            # One blank line right before and right after a "---" is just
+            # padding (it keeps other renderers from reading the text above
+            # as a heading) - not lines of the document.
+            if blocks and blocks[-1].get('blank'):
+                blocks.pop()
+            blocks.append({'kind': 'hr'})
+            after_hr = True
+            i += 1
+            continue
+        else:
+            m = _MD_HEADING_RE.match(line)
+            if m:
+                blocks.append({'kind': 'heading', 'level': len(m.group(1)),
+                               'spans': md_parse_inline(m.group(2) or '')})
+                i += 1
+                continue
+            m = _MD_QUOTE_RE.match(line)
+            if m:
+                blocks.append({'kind': 'quote', 'spans': md_parse_inline(m.group(1))})
+                i += 1
+                continue
+            m = _MD_BULLET_RE.match(line)
+            if m:
+                blocks.append({'kind': 'list',
+                               'prefix': "\t" * _md_indent_depth(m.group(1)) + "\u2022 ",
+                               'spans': md_parse_inline(m.group(3))})
+                i += 1
+                continue
+            m = _MD_NUMBERED_RE.match(line)
+            if m:
+                blocks.append({'kind': 'list',
+                               'prefix': ("\t" * _md_indent_depth(m.group(1))
+                                          + m.group(2) + "." + m.group(3)),
+                               'spans': md_parse_inline(m.group(4))})
+                i += 1
+                continue
+            if i + 1 < len(lines):
+                u = _MD_SETEXT_RE.match(lines[i + 1])
+                if u:
+                    # "Title" over "===" is a level 1 heading, over "---" level 2.
+                    blocks.append({'kind': 'heading', 'level': 1 if u.group(1)[0] == '=' else 2,
+                                   'setext': True, 'spans': md_parse_inline(line)})
+                    i += 2
+                    continue
+            blocks.append({'kind': 'para', 'spans': md_parse_inline(line)})
+        i += 1
+    return blocks
+
+
+# --- Serialization (QTextDocument -> Markdown) --------------------------
+
+_MD_ESCAPE_BACKSLASH_RE = re.compile(r'\\(?=[' + re.escape(''.join(sorted(_MD_ASCII_PUNCT))) + r'])')
+
+
+def _md_escape_plain(text):
+    """Typed text is written out as typed. The one thing that must be
+    protected is a backslash in front of punctuation (or at the end of a
+    line), which a reader would take for an escape sequence / line break
+    marker - it is doubled."""
+    return _MD_ESCAPE_BACKSLASH_RE.sub(r'\\\\', text)
+
+
+def _md_format_destination(dest):
+    if re.search(r'[\s()]', dest) and '<' not in dest and '>' not in dest:
+        return '<' + dest + '>'
+    return dest
+
+
+def _md_code_span(text):
+    longest = max((len(r) for r in re.findall(r'`+', text)), default=0)
+    fence = '`' * (longest + 1)
+    pad = ' ' if (text.startswith('`') or text.endswith('`')
+                  or (text.startswith(' ') and text.endswith(' ') and text.strip(' '))) else ''
+    return fence + pad + text + pad + fence
+
+
+def _md_wrap(open_tag, close_tag, inner):
+    """Wraps `inner` in emphasis markers, keeping edge whitespace outside
+    them (a marker next to whitespace is not an emphasis marker)."""
+    core = inner.strip(' \t')
+    if not core:
+        return inner
+    lead = inner[:len(inner) - len(inner.lstrip(' \t'))]
+    trail = inner[len(inner.rstrip(' \t')):]
+    return lead + open_tag + core + close_tag + trail
+
+
+def _md_leaf(run, in_link):
+    if run['media'] is not None:
+        alt, src = run['media']
+        alt = _md_escape_plain(alt).replace('[', '\\[').replace(']', '\\]')
+        return '![' + alt + '](' + _md_format_destination(src) + ')'
+    if run['code']:
+        return _md_code_span(run['text'])
+    text = _md_escape_plain(run['text'])
+    if in_link:
+        text = text.replace('[', '\\[').replace(']', '\\]')
+    return text
+
+
+_MD_NEST_LEVELS = (('underline', '<u>', '</u>'), ('bold', '**', '**'), ('italic', '*', '*'))
+
+
+def _md_nest(runs, levels, ignore_bold, ignore_italic, in_link):
+    if not levels:
+        return ''.join(_md_leaf(r, in_link) for r in runs)
+    key, open_tag, close_tag = levels[0]
+
+    def flag(r):
+        if key == 'bold' and ignore_bold:
+            return False
+        if key == 'italic' and ignore_italic:
+            return False
+        return r[key]
+
+    out = []
+    i = 0
+    while i < len(runs):
+        f = flag(runs[i])
+        j = i
+        while j < len(runs) and flag(runs[j]) == f:
+            j += 1
+        inner = _md_nest(runs[i:j], levels[1:], ignore_bold, ignore_italic, in_link)
+        out.append(_md_wrap(open_tag, close_tag, inner) if f else inner)
+        i = j
+    return ''.join(out)
+
+
+def _md_emit_line(runs, ignore_bold, ignore_italic):
+    out = []
+    i = 0
+    while i < len(runs):
+        href = runs[i]['href']
+        j = i
+        while j < len(runs) and runs[j]['href'] == href:
+            j += 1
+        inner = _md_nest(runs[i:j], _MD_NEST_LEVELS, ignore_bold, ignore_italic, href is not None)
+        if href is not None:
+            out.append('[' + inner + '](' + _md_format_destination(href) + ')')
+        else:
+            out.append(inner)
+        i = j
+    line = ''.join(out)
+    if _MD_TRAILING_BACKSLASH_RE.search(line):
+        # A lone backslash at the end of a line is a line-break marker when
+        # read back; a real one has to be written doubled.
+        line += '\\'
+    return line
+
+
+def _md_block_runs(block, skip=0):
+    runs = []
+    it = block.begin()
+    while not it.atEnd():
+        frag = it.fragment()
+        it += 1
+        if not frag.isValid() or frag.length() == 0:
+            continue
+        text = frag.text()
+        if skip > 0:
+            if len(text) <= skip:
+                skip -= len(text)
+                continue
+            text = text[skip:]
+            skip = 0
+        fmt = frag.charFormat()
+        media = None
+        if fmt.objectType() == MEDIA_OBJECT_TYPE:
+            media = (fmt.property(MEDIA_ALT_PROP) or "", fmt.property(MEDIA_SRC_PROP) or "")
+        runs.append({
+            'text': text,
+            'media': media,
+            'bold': fmt.fontWeight() == QFont.Bold,
+            'italic': bool(fmt.fontItalic()),
+            'underline': bool(fmt.fontUnderline()) and not fmt.isAnchor(),
+            'code': fmt.hasProperty(CODE_PROP) and fmt.property(CODE_PROP) == True,
+            'href': fmt.anchorHref() if fmt.isAnchor() else None,
+        })
+    return runs
+
+
+def _md_inline_lines(block, skip=0, ignore_bold=False, ignore_italic=False):
+    """The block's text as Markdown, one string per visual line (a
+    Shift+Enter soft break starts a new line, exactly like Enter)."""
+    lines = [[]]
+    for r in _md_block_runs(block, skip):
+        if r['media'] is not None:
+            lines[-1].append(r)
+            continue
+        for k, part in enumerate(r['text'].split(MD_LINE_SEP)):
+            if k > 0:
+                lines.append([])
+            if part:
+                rr = dict(r)
+                rr['text'] = part
+                lines[-1].append(rr)
+    return [_md_emit_line(runs, ignore_bold, ignore_italic) for runs in lines]
+
+
+def _md_table_lines(table, doc):
+    cols = table.columns()
+
+    def cell_md(r, c):
+        cell = table.cellAt(r, c)
+        end = cell.lastPosition()
+        blk = doc.findBlock(cell.firstPosition())
+        parts = []
+        while blk.isValid() and blk.position() <= end:
+            # A header cell is always drawn bold by the table style, so its
+            # weight says nothing about what the user typed.
+            parts.append('<br>'.join(_md_inline_lines(blk, 0, ignore_bold=(r == 0))))
+            blk = blk.next()
+        return '<br>'.join(parts).replace('|', '\\|')
+
+    out = ['| ' + ' | '.join(cell_md(0, c) for c in range(cols)) + ' |']
+    markers = {"left": "---", "center": ":---:", "right": "---:"}
+    out.append('| ' + ' | '.join(markers.get(get_table_column_alignment(table, c), "---")
+                                 for c in range(cols)) + ' |')
+    for r in range(1, table.rows()):
+        out.append('| ' + ' | '.join(cell_md(r, c) for c in range(cols)) + ' |')
+    return out
+
+
+def _md_collect_items(doc):
+    items = []
+    block = doc.firstBlock()
+    last_char = doc.characterCount() - 1
+    while block.isValid():
+        table = QTextCursor(block).currentTable()
+        if table:
+            if block.position() == table.firstCursorPosition().block().position():
+                items.append({'kind': 'table', 'lines': _md_table_lines(table, doc)})
+                after = table.lastPosition() + 1
+                if after > last_char:
+                    break
+                block = doc.findBlock(after)
+                if block.text() == "" and not block.next().isValid():
+                    break   # the paragraph Qt keeps after a table that ends the document
+            else:
+                block = block.next()
+            continue
+
+        bf = block.blockFormat()
+        text = block.text()
+        level = bf.headingLevel()
+        nxt = block.next()
+        if (text == "" and block.position() == 0 and nxt.isValid()
+                and QTextCursor(nxt).currentTable() is not None):
+            # The paragraph Qt insists on in front of a table that opens the
+            # document - structure, not a line the user wrote.
+            block = nxt
+            continue
+        if bf.hasProperty(HR_PROP) and bf.property(HR_PROP) == True:
+            items.append({'kind': 'hr'})
+        elif bf.hasProperty(BLOCK_CODE_PROP) and bf.property(BLOCK_CODE_PROP) == True:
+            info = bf.property(CODE_LANG_PROP) if bf.hasProperty(CODE_LANG_PROP) else ""
+            items.append({'kind': 'code', 'lines': text.split(MD_LINE_SEP), 'info': info or ""})
+        elif level > 0:
+            lines = _md_inline_lines(block, ignore_bold=True)
+            if (level <= 2 and len(lines) == 1 and lines[0].strip()
+                    and bf.hasProperty(SETEXT_PROP) and bf.property(SETEXT_PROP) == True):
+                items.append({'kind': 'heading', 'lines': [lines[0], "===" if level == 1 else "---"]})
+            else:
+                items.append({'kind': 'heading', 'lines': ["#" * level + " " + lines[0]] + lines[1:]})
+        elif bf.hasProperty(QUOTE_PROP) and bf.property(QUOTE_PROP) == True:
+            lines = _md_inline_lines(block, ignore_italic=True)
+            items.append({'kind': 'quote', 'lines': ["> " + l for l in lines]})
+        else:
+            m = _MD_BULLET_OUT_RE.match(text)
+            n = None if m else LIST_NUMBERED_RE.match(text)
+            if m:
+                prefix = "\t" * _md_indent_depth(m.group(1)) + "- "
+                skip = m.end()
+            elif n:
+                prefix = text[:n.start(4)]
+                skip = n.start(4)
+            else:
+                prefix = None
+                skip = 0
+            lines = _md_inline_lines(block, skip)
+            if prefix is not None:
+                items.append({'kind': 'list', 'lines': [prefix + lines[0]] + lines[1:]})
+            else:
+                items.append({'kind': 'para', 'lines': lines})
+        block = block.next()
+    return items
+
+
+def md_serialize(editor):
+    """The editor's document as Markdown source text (no trailing newline
+    after the last line - File > Save adds the one that terminates it)."""
+    items = _md_collect_items(editor.document())
+    entries = []   # [kind, text]
+    idx = 0
+    while idx < len(items):
+        it = items[idx]
+        kind = it['kind']
+        if kind == 'code':
+            code_lines = []
+            while idx < len(items) and items[idx]['kind'] == 'code':
+                code_lines.extend(items[idx]['lines'])
+                idx += 1
+            longest = 0
+            for l in code_lines:
+                m = re.match(r'\s*(`+)', l)
+                if m:
+                    longest = max(longest, len(m.group(1)))
+            fence = '`' * max(3, longest + 1)
+            entries.append(['code', fence + it['info']])
+            entries.extend(['code', l] for l in code_lines)
+            entries.append(['code', fence])
+            continue
+        if kind == 'hr':
+            # Blank line on each side keeps "text" directly above "---" from
+            # being read as a heading by other renderers; md_parse() treats
+            # these two blank lines as padding, not as document lines.
+            if entries and entries[-1][0] != 'pad':
+                entries.append(['pad', ''])
+            entries.append(['hr', '---'])
+            if idx + 1 < len(items):
+                entries.append(['pad', ''])
+        elif kind == 'list':
+            entries.append(['list', it['lines'][0]])
+            entries.extend(['para', l] for l in it['lines'][1:])
+        elif kind == 'para':
+            # An empty line is written as a lone <br>: one <br> = one line.
+            entries.extend(['para', l if l.strip() else '<br>'] for l in it['lines'])
+        else:
+            entries.extend([kind, l] for l in it['lines'])
+        idx += 1
+
+    # The only line-break marker this editor writes is <br>. Two adjacent
+    # lines of text get one at the end of the first (so other Markdown
+    # renderers don't fold them into one paragraph); the "\n" after it
+    # is just the file's own line ending and is not an extra line.
+    for i in range(len(entries) - 1):
+        cur, nxt = entries[i], entries[i + 1]
+        if (cur[0] in ('para', 'list') and cur[1] != '<br>' and cur[1].strip()
+                and nxt[0] == 'para' and nxt[1] != '<br>' and nxt[1].strip()):
+            cur[1] += '<br>'
+    return "\n".join(e[1] for e in entries)
+
+
+def _md_media_char_format(media_type, src, alt, media_id=None):
+    fmt = QTextCharFormat()
+    fmt.setObjectType(MEDIA_OBJECT_TYPE)
+    fmt.setProperty(MEDIA_TYPE_PROP, media_type)
+    fmt.setProperty(MEDIA_SRC_PROP, src)
+    fmt.setProperty(MEDIA_ALT_PROP, alt)
+    fmt.setProperty(MEDIA_ID_PROP, media_id or str(uuid.uuid4()))
+    return fmt
 
 
 class Editor(QTextEdit):
@@ -1643,6 +2541,7 @@ class Editor(QTextEdit):
         self._caret_visible = True
         self._code_copy_icon_rects = []   # [(QRect, block_start_pos, block_end_pos)], set in paintEvent
         self._code_copy_hover_pos = None
+        self._code_runs = []
         self._caret_timer = QTimer(self)
         self._caret_timer.timeout.connect(self._toggle_caret)
         flash_time = QApplication.cursorFlashTime()
@@ -1672,6 +2571,13 @@ class Editor(QTextEdit):
 
         self.line_number_area = LineNumberArea(self)
         self.textChanged.connect(self.update_line_number_area_width)
+        self._code_pad_busy = False
+        self._code_pad_range = None
+        self._code_pad_timer = QTimer(self)
+        self._code_pad_timer.setSingleShot(True)
+        self._code_pad_timer.setInterval(0)
+        self._code_pad_timer.timeout.connect(self._normalize_code_padding)
+        self.document().contentsChange.connect(self._on_code_pad_contents_change)
         self.verticalScrollBar().valueChanged.connect(self.line_number_area.update)
         self.cursorPositionChanged.connect(self.highlight_current_line)
         self.cursorPositionChanged.connect(self.line_number_area.update)
@@ -1767,6 +2673,102 @@ class Editor(QTextEdit):
         self._caret_timer.stop()
         self._caret_visible = False
         self.viewport().repaint()
+
+    @staticmethod
+    def _block_is_code(b):
+        if not b.isValid():
+            return False
+        f = b.blockFormat()
+        return f.hasProperty(BLOCK_CODE_PROP) and f.property(BLOCK_CODE_PROP) == True
+
+    def _on_code_pad_contents_change(self, position, removed, added):
+        """Remember which part of the document changed; the margins of the code
+        blocks around it are fixed up once the current edit has finished."""
+        if self._code_pad_busy:
+            return
+        hi = position + max(removed, added)
+        if self._code_pad_range is None:
+            self._code_pad_range = [position, hi]
+        else:
+            self._code_pad_range[0] = min(self._code_pad_range[0], position)
+            self._code_pad_range[1] = max(self._code_pad_range[1], hi)
+        self._code_pad_timer.start()
+
+    def _normalize_code_padding(self):
+        """Give every code block its padding margins: left/right on every line,
+        extra top on the first line of a run and extra bottom on the last one
+        (lines in the middle stay tightly packed). Blocks that are no longer
+        code lose these margins again."""
+        rng = self._code_pad_range
+        self._code_pad_range = None
+        if rng is None or self._code_pad_busy:
+            return
+        doc = self.document()
+        last_pos = max(doc.characterCount() - 1, 0)
+        first = doc.findBlock(min(rng[0], last_pos))
+        last = doc.findBlock(min(rng[1], last_pos))
+        if first.previous().isValid():
+            first = first.previous()
+        stop_number = last.next().blockNumber() if last.next().isValid() else last.blockNumber()
+
+        changes = []
+        b = first
+        while b.isValid():
+            fmt = b.blockFormat()
+            if self._block_is_code(b):
+                top = 0 if self._block_is_code(b.previous()) else CODE_PAD_Y
+                bottom = 0 if self._block_is_code(b.next()) else CODE_PAD_Y
+                want = (CODE_PAD_X, CODE_PAD_RIGHT, top, bottom)
+                have = (fmt.leftMargin(), fmt.rightMargin(), fmt.topMargin(), fmt.bottomMargin())
+                if want != have or not fmt.hasProperty(CODE_PAD_PROP):
+                    nf = QTextBlockFormat(fmt)
+                    nf.setLeftMargin(want[0]); nf.setRightMargin(want[1])
+                    nf.setTopMargin(want[2]); nf.setBottomMargin(want[3])
+                    nf.setProperty(CODE_PAD_PROP, True)
+                    changes.append((b.position(), nf))
+            elif fmt.hasProperty(CODE_PAD_PROP):
+                nf = QTextBlockFormat(fmt)
+                is_quote = fmt.hasProperty(QUOTE_PROP) and fmt.property(QUOTE_PROP) == True
+                nf.setLeftMargin(15 if is_quote else 0)
+                nf.setRightMargin(0); nf.setTopMargin(0); nf.setBottomMargin(0)
+                nf.clearProperty(CODE_PAD_PROP)
+                changes.append((b.position(), nf))
+            if b.blockNumber() >= stop_number:
+                break
+            b = b.next()
+
+        if not changes:
+            return
+        undo_steps = doc.availableUndoSteps()
+        if doc.availableRedoSteps() > 0:
+            # Right after an Undo: touching the document now would wipe the
+            # redo history. Try again on the next real edit instead.
+            self._code_pad_range = [rng[0], rng[1]]
+            return
+
+        was_modified = doc.isModified()
+        self._code_pad_busy = True
+        try:
+            toggle_undo = (undo_steps == 0 and doc.isUndoRedoEnabled())
+            if toggle_undo:
+                doc.setUndoRedoEnabled(False)     # nothing to lose: stack is empty
+            cur = QTextCursor(doc)
+            if toggle_undo:
+                cur.beginEditBlock()
+            elif undo_steps > 0:
+                cur.joinPreviousEditBlock()       # fold into the edit that caused it
+            else:
+                cur.beginEditBlock()
+            for pos, nf in changes:
+                cur.setPosition(pos)
+                cur.setBlockFormat(nf)
+            cur.endEditBlock()
+            if toggle_undo:
+                doc.setUndoRedoEnabled(True)
+        finally:
+            self._code_pad_busy = False
+            doc.setModified(was_modified)
+        self.viewport().update()
 
     def apply_word_wrap(self):
         """Apply the Edit > Word Wrap setting to this editor. Qt's Markdown
@@ -1900,6 +2902,49 @@ class Editor(QTextEdit):
             bg_painter.fillRect(0, y_top, self.viewport().width(), y_h, line_color)
             bg_painter.end()
 
+        # Padded background for code blocks. Qt only fills a block's background
+        # inside its margins, so the margin area (the padding) is filled here,
+        # before the document is painted. The same colour is then painted over
+        # the text area by Qt itself, so both parts merge into one box.
+        doc_layout = self.document().documentLayout()
+        doc_layout.documentSize()   # make sure layout is up to date
+        _scroll_y = self.verticalScrollBar().value()
+        _scroll_x = self.horizontalScrollBar().value()
+        _view_h = self.viewport().height()
+        self._code_runs = []        # [(first_block, last_block, top, bottom, left, right)] in viewport coords
+        pad_painter = QPainter(self.viewport())
+        pad_color = QColor(self.settings['code_bg'])
+
+        def _vis_code(b):
+            return b.isValid() and b.isVisible() and self._block_is_code(b)
+
+        _b = self.document().firstBlock()
+        while _b.isValid():
+            if not _vis_code(_b):
+                _b = _b.next()
+                continue
+            _first = _b
+            _last = _b
+            _right = 0.0
+            _blk = _b
+            while _vis_code(_blk):
+                _r = doc_layout.blockBoundingRect(_blk)
+                _f = _blk.blockFormat()
+                _right = max(_right, _r.left() + _r.width() + _f.leftMargin() + _f.rightMargin())
+                _last = _blk
+                _blk = _blk.next()
+            _r1 = doc_layout.blockBoundingRect(_first)
+            _r2 = doc_layout.blockBoundingRect(_last)
+            _top = _r1.top() - _first.blockFormat().topMargin() - _scroll_y
+            _bottom = _r2.bottom() + _last.blockFormat().bottomMargin() - _scroll_y
+            _left = _r1.left() - _scroll_x
+            _right -= _scroll_x
+            if _bottom >= 0 and _top <= _view_h:
+                pad_painter.fillRect(QRectF(_left, _top, _right - _left, _bottom - _top), pad_color)
+            self._code_runs.append((_first, _last, _top, _bottom, _left, _right))
+            _b = _blk
+        pad_painter.end()
+
         super().paintEvent(event)
 
         # Draw quote-group bars on top of text.
@@ -1960,6 +3005,15 @@ class Editor(QTextEdit):
         hr_block = self.document().firstBlock()
         while hr_block.isValid():
             hbf = hr_block.blockFormat()
+            if hr_block.isVisible() and is_setext_block(hbf):
+                s_color, s_thick = setext_line_style(self.settings, hbf.headingLevel())
+                s_rect = self.document().documentLayout().blockBoundingRect(hr_block)
+                s_h_dev = max(1, round(s_thick * dpr))
+                s_top = round((s_rect.bottom() + setext_line_gap(self.settings) - self.verticalScrollBar().value()) * dpr) / dpr
+                if s_top + s_h_dev / dpr >= 0 and s_top <= viewport_height:
+                    s_right = self.viewport().width() - 4
+                    if s_right > 4:
+                        hr_painter.fillRect(QRectF(4, s_top, s_right - 4, s_h_dev / dpr), s_color)
             if (hr_block.isValid() and hr_block.isVisible()
                     and hbf.hasProperty(HR_PROP) and hbf.property(HR_PROP) == True):
                 rect = self.document().documentLayout().blockBoundingRect(hr_block)
@@ -1984,25 +3038,8 @@ class Editor(QTextEdit):
         icon_size = 16
         icon_margin = 6
 
-        def is_code_block(b):
-            return (b.isValid() and b.isVisible()
-                    and b.blockFormat().hasProperty(BLOCK_CODE_PROP)
-                    and b.blockFormat().property(BLOCK_CODE_PROP) == True)
-
-        code_block = self.document().firstBlock()
-        while code_block.isValid():
-            if not is_code_block(code_block):
-                code_block = code_block.next()
-                continue
-            region_start = code_block
-            region_end = code_block
-            nxt = code_block.next()
-            while is_code_block(nxt):
-                region_end = nxt
-                nxt = nxt.next()
-
-            start_rect = self.document().documentLayout().blockBoundingRect(region_start)
-            top = int(start_rect.top() - self.verticalScrollBar().value())
+        for region_start, region_end, run_top, _run_bottom, _run_left, _run_right in self._code_runs:
+            top = int(run_top)
             if -icon_size <= top <= viewport_height:
                 btn_x = self.viewport().width() - icon_size - icon_margin - 2
                 btn_y = top + icon_margin
@@ -2024,7 +3061,6 @@ class Editor(QTextEdit):
                 icon_painter.drawRoundedRect(front, 1.5, 1.5)
                 self._code_copy_icon_rects.append((btn_rect, region_start.position(),
                                                     region_end.position() + region_end.length() - 1))
-            code_block = nxt
         icon_painter.end()
 
         # Draw our own caret (see __init__ comment for why Qt's built-in
@@ -2605,63 +3641,9 @@ class Editor(QTextEdit):
         exactly as given (so relative paths and URLs round-trip through
         Markdown unchanged); resolution to an actual loadable path/URL
         happens on demand when painting."""
-        fmt = QTextCharFormat()
-        fmt.setObjectType(MEDIA_OBJECT_TYPE)
-        fmt.setProperty(MEDIA_TYPE_PROP, media_type)
-        fmt.setProperty(MEDIA_SRC_PROP, src)
-        fmt.setProperty(MEDIA_ALT_PROP, alt)
-        fmt.setProperty(MEDIA_ID_PROP, str(uuid.uuid4()))
         cursor = self.textCursor()
-        cursor.insertText("\ufffc", fmt)
+        cursor.insertText("\ufffc", _md_media_char_format(media_type, src, alt))
         self.setTextCursor(cursor)
-
-    def replace_media_placeholders(self, media_matches):
-        """Called right after document().setMarkdown() replaces the whole
-        document: Qt's own Markdown importer already turned every
-        ![alt](src) into a plain static QTextImageFormat fragment (and
-        silently dropped the alt text - see media_matches, extracted from
-        the raw source beforehand). This walks those fragments and, for
-        every one whose src is a recognized image/gif/video/audio file,
-        swaps it for a real embedded media object (restoring the alt
-        text); anything else becomes an ordinary hyperlink instead, since
-        it isn't something this app can actually embed.
-        """
-        doc = self.document()
-        queue = list(media_matches)
-        replacements = []  # (start, end, media_type_or_None, src, alt)
-
-        block = doc.firstBlock()
-        while block.isValid():
-            it = block.begin()
-            while not it.atEnd():
-                frag = it.fragment()
-                if frag.isValid() and frag.charFormat().isImageFormat():
-                    src = frag.charFormat().toImageFormat().name()
-                    alt = queue.pop(0)[0] if queue else ""
-                    media_type = classify_media_path(src)
-                    replacements.append((frag.position(), frag.position() + frag.length(), media_type, src, alt))
-                it += 1
-            block = block.next()
-
-        for start, end, media_type, src, alt in reversed(replacements):
-            cursor = QTextCursor(doc)
-            cursor.setPosition(start)
-            cursor.setPosition(end, QTextCursor.KeepAnchor)
-            if media_type:
-                fmt = QTextCharFormat()
-                fmt.setObjectType(MEDIA_OBJECT_TYPE)
-                fmt.setProperty(MEDIA_TYPE_PROP, media_type)
-                fmt.setProperty(MEDIA_SRC_PROP, src)
-                fmt.setProperty(MEDIA_ALT_PROP, alt)
-                fmt.setProperty(MEDIA_ID_PROP, str(uuid.uuid4()))
-                cursor.insertText("\ufffc", fmt)
-            else:
-                fmt = QTextCharFormat()
-                fmt.setAnchor(True)
-                fmt.setAnchorHref(src)
-                fmt.setForeground(QColor(self.settings["link"]))
-                fmt.setFontUnderline(self.settings.get("link_underline", True))
-                cursor.insertText(alt if alt else src, fmt)
 
     def release_media_players(self):
         """Stop every live QMediaPlayer this editor owns, so closing a tab
@@ -3201,6 +4183,39 @@ class Editor(QTextEdit):
                 self.window().update_toolbar_state()
                 return
 
+            if (self.view_mode == "formatted" and not cursor.hasSelection()
+                    and block_fmt.headingLevel() > 0 and not is_quote
+                    and not is_block_code and not is_hr and block.text()
+                    and cursor.position() - block.position() < len(block.text())):
+                # Enter at the start or in the middle of a heading. Qt's own
+                # handling leaves the second half with its heading
+                # size/colour/bold but with the heading *level* removed - so
+                # the text looks like a heading yet is saved as "**text**".
+                # Done by hand instead:
+                #  - at the very start: an empty normal line goes above, the
+                #    heading stays a heading (this is "make some space above
+                #    it");
+                #  - in the middle: both halves stay headings.
+                at_start = cursor.position() == block.position()
+                cursor.beginEditBlock()
+                cursor.insertBlock()
+                lower = cursor.block()
+                upper = lower.previous()
+                cursor.setBlockFormat(block_fmt)
+                if at_start:
+                    up = QTextCursor(upper)
+                    up.setBlockFormat(QTextBlockFormat())
+                    plain_char = QTextCharFormat()
+                    plain_char.setForeground(QColor(self.settings['editor_text']))
+                    plain_char.setFontFamilies([self.settings['font_family']])
+                    plain_char.setFontPointSize(self.settings['font_size'])
+                    plain_char.setFontWeight(QFont.Normal)
+                    up.setBlockCharFormat(plain_char)
+                cursor.endEditBlock()
+                self.setTextCursor(cursor)
+                self.window().update_toolbar_state()
+                return
+
             if is_quote:
                 if block.text().strip() == '':
                     cursor.beginEditBlock()
@@ -3503,174 +4518,162 @@ class Editor(QTextEdit):
         self.insertFromMimeData(mime)
         self.ensureCursorVisible()
 
-    def post_process_markdown(self):
-        cursor = QTextCursor(self.document())
+    # --- Markdown import (Markdown source -> this editor's document) ---
+
+    def make_table_format(self, cols):
+        """Format for a new table. A bare insertTable(rows, cols) leaves
+        every column unconstrained and Qt shrinks empty columns to ~0px, so
+        columns are sized to their content and cells get padding/borders."""
+        fmt = QTextTableFormat()
+        fmt.setCellPadding(6)
+        fmt.setCellSpacing(0)
+        fmt.setBorder(1)
+        fmt.setBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+        fmt.setBorderBrush(QColor("#555555"))
+        fmt.setColumnWidthConstraints([QTextLength(QTextLength.VariableLength, 0)] * cols)
+        return fmt
+
+    def _md_base_char_format(self, in_table=False):
+        fmt = QTextCharFormat()
+        fmt.setFontFamilies([self.settings['font_family']])
+        fmt.setFontPointSize(self.settings['font_size'])
+        if not in_table:
+            # Table cells take their colour from the cell format (see
+            # apply_table_style), so it must not be pinned on the text.
+            fmt.setForeground(QColor(self.settings['editor_text']))
+        return fmt
+
+    def _md_write_spans(self, cursor, spans, base_fmt):
+        s = self.settings
+        for sp in spans:
+            if sp.media is not None:
+                alt, src = sp.media
+                media_type = classify_media_path(src)
+                if media_type:
+                    cursor.insertText("￼", _md_media_char_format(media_type, src, alt))
+                else:
+                    # Not an embeddable file: keep it as an ordinary link.
+                    fmt = QTextCharFormat(base_fmt)
+                    fmt.setAnchor(True)
+                    fmt.setAnchorHref(src)
+                    fmt.setForeground(QColor(s['link']))
+                    fmt.setFontUnderline(s.get("link_underline", True))
+                    cursor.insertText(alt or src, fmt)
+                continue
+            fmt = QTextCharFormat(base_fmt)
+            if sp.bold:
+                fmt.setFontWeight(QFont.Bold)
+            if sp.italic:
+                fmt.setFontItalic(True)
+            if sp.underline:
+                fmt.setFontUnderline(True)
+            if sp.code:
+                fmt.setProperty(CODE_PROP, True)
+                fmt.setFontFamilies(["Consolas"])
+                fmt.setBackground(QColor(s['code_bg']))
+            if sp.href is not None:
+                fmt.setAnchor(True)
+                fmt.setAnchorHref(sp.href)
+                fmt.setForeground(QColor(s['link']))
+                fmt.setFontUnderline(s.get("link_underline", True))
+            cursor.insertText(sp.text, fmt)
+
+    def load_markdown(self, source):
+        """Replaces the whole document with `source` (Markdown text),
+        drawn straight from md_parse()'s block model and styled with the
+        current settings. Callers handle undo/bulk-load bookkeeping."""
+        blocks = md_parse(source)
+        s = self.settings
+        doc = self.document()
+        doc.clear()
+
+        base_fmt = self._md_base_char_format()
+        cursor = QTextCursor(doc)
         cursor.beginEditBlock()
-        
-        # Running per-depth counters used to rebuild OUR OWN nested-numbered-
-        # list convention ("\t"*depth + "2.1." + " " + content, see
-        # LIST_NUMBERED_RE) out of Qt's real QTextList objects below. This
-        # can't just read Qt's own text_list.itemNumber(block): items are
-        # converted to plain text and removed from their QTextList one at a
-        # time in this same loop, and remove() re-indexes every remaining
-        # item in that list immediately - so itemNumber() queried *after* an
-        # earlier sibling has already been removed comes back wrong (every
-        # item ends up reporting position 0, i.e. "1."). Tracking our own
-        # depth-keyed counters, incremented/truncated as blocks are walked in
-        # document order, sidesteps that entirely and also reconstructs the
-        # indentation nested items need but Qt's flat itemNumber() can't
-        # express on its own.
-        list_counters = []
-        
-        block = self.document().firstBlock()
-        while block.isValid():
-            next_block = block.next()
-            temp_cursor = QTextCursor(block)
-            
-            if temp_cursor.currentTable():
-                block = next_block
-                continue
+        try:
+            fresh = True    # True while the current block is an empty one to write into
+            for blk in blocks:
+                kind = blk['kind']
 
-            # Qt's Markdown importer gives ordinary paragraphs a 6px
-            # top/bottom margin. QTextCursor.insertBlock() copies whatever
-            # format the current block has, so once a document has been
-            # loaded from Markdown every further Enter keeps propagating
-            # (and stacking with the document's own paragraph spacing)
-            # that margin, making each new line look like it has extra
-            # blank space above and below it. Strip it back to 0 so a
-            # block-format created by Enter never carries margins forward.
-            margin_fmt = block.blockFormat()
-            if margin_fmt.topMargin() != 0 or margin_fmt.bottomMargin() != 0:
-                new_margin_fmt = QTextBlockFormat(margin_fmt)
-                new_margin_fmt.setTopMargin(0)
-                new_margin_fmt.setBottomMargin(0)
-                temp_cursor.setBlockFormat(new_margin_fmt)
-
-            block_fmt_hr = block.blockFormat()
-            if block_fmt_hr.hasProperty(QTextFormat.BlockTrailingHorizontalRulerWidth):
-                # Qt's own Markdown importer already recognizes "---" as a
-                # thematic break and marks the (empty) block with this
-                # property. Take over its rendering with our own HR_PROP so
-                # the line uses the user-configurable color/thickness
-                # instead of Qt's built-in style, and drop the native
-                # property so Qt doesn't also draw its own rule underneath.
-                new_hr_fmt = QTextBlockFormat(block_fmt_hr)
-                new_hr_fmt.clearProperty(QTextFormat.BlockTrailingHorizontalRulerWidth)
-                new_hr_fmt.setProperty(HR_PROP, True)
-                temp_cursor.setBlockFormat(new_hr_fmt)
-                block = next_block
-                continue
-
-            text_list = temp_cursor.currentList()
-            is_list = text_list is not None
-            if is_list:
-                fmt = text_list.format()
-                style = fmt.style()
-                prefix = ""
-                if style == QTextListFormat.Style.ListDecimal:
-                    # depth 0 = top level, matching LIST_NUMBERED_RE's one-
-                    # tab-per-level convention; Qt reports indent=1 for a
-                    # top-level list.
-                    depth = max(fmt.indent() - 1, 0)
-                    if depth >= len(list_counters):
-                        list_counters.extend([0] * (depth - len(list_counters) + 1))
-                    else:
-                        del list_counters[depth + 1:]
-                    list_counters[depth] += 1
-                    numbers = list_counters[:depth + 1]
-                    prefix = "\t" * depth + '.'.join(map(str, numbers)) + '. '
-                else:
-                    list_counters = []
-                    if style == QTextListFormat.Style.ListSquare:
-                        prefix = "■ "
-                    else:
-                        prefix = "• "
-                    
-                text_list.remove(block)
-                temp_cursor.insertText(prefix)
-                is_list = False
-            else:
-                # A non-list block breaks the run - the next numbered list
-                # (if any) starts fresh at "1." rather than continuing this
-                # one's counters.
-                list_counters = []
-                
-            block_fmt = block.blockFormat()
-            
-            is_code_block = False
-            if block_fmt.hasProperty(QTextFormat.BackgroundBrush):
-                bg = block_fmt.background().color()
-                editor_bg = QColor(self.settings['editor_bg'])
-                if bg.isValid() and bg != Qt.transparent and bg != editor_bg:
-                    is_code_block = True
-
-            if not is_code_block:
-                frags_total = 0
-                frags_code = 0
-                it = block.begin()
-                while not it.atEnd():
-                    frag = it.fragment()
-                    if frag.isValid() and frag.length() > 0:
-                        frags_total += 1
-                        f_fmt = frag.charFormat()
-                        frag_bg = f_fmt.background().color() if f_fmt.hasProperty(QTextFormat.BackgroundBrush) else QColor(Qt.transparent)
-                        editor_bg = QColor(self.settings['editor_bg'])
-                        if frag_bg.isValid() and frag_bg != Qt.transparent and frag_bg != editor_bg:
-                            frags_code += 1
+                if kind == 'code':
+                    for n, line in enumerate(blk['lines']):
+                        bf = QTextBlockFormat()
+                        bf.setProperty(BLOCK_CODE_PROP, True)
+                        bf.setBackground(QColor(s['code_bg']))
+                        if n == 0 and blk['info']:
+                            bf.setProperty(CODE_LANG_PROP, blk['info'])
+                        cf = QTextCharFormat(base_fmt)
+                        cf.setProperty(CODE_PROP, True)
+                        cf.setFontFamilies(["Consolas"])
+                        cf.setForeground(QColor(s['code']))
+                        if fresh:
+                            cursor.setBlockFormat(bf)
+                            cursor.setBlockCharFormat(cf)
                         else:
-                            fam_list = f_fmt.fontFamilies()
-                            fam = fam_list[0].lower() if fam_list else ""
-                            if fam and ("courier" in fam or "mono" in fam or "consolas" in fam):
-                                frags_code += 1
-                    it += 1
-                if frags_total > 0 and frags_total == frags_code:
-                    is_code_block = True
+                            cursor.insertBlock(bf, cf)
+                        if line:
+                            cursor.insertText(line, cf)
+                        fresh = False
+                    continue
 
-            if is_code_block and block_fmt.hasProperty(QTextFormat.BackgroundBrush):
-                block_fmt.clearBackground()
-                temp_cursor.setBlockFormat(block_fmt)
+                if kind == 'table':
+                    # Qt needs a paragraph in front of every table. When one
+                    # was just written (a line of text, an empty line, a
+                    # heading...) the table simply goes at its end; only at
+                    # the very start of the document is a placeholder
+                    # paragraph unavoidable.
+                    if fresh:
+                        cursor.setBlockFormat(QTextBlockFormat())
+                        cursor.setBlockCharFormat(base_fmt)
+                    cols = len(blk['header'])
+                    table = cursor.insertTable(1 + len(blk['rows']), cols,
+                                               self.make_table_format(cols))
+                    cell_fmt = self._md_base_char_format(in_table=True)
+                    for r, row in enumerate([blk['header']] + blk['rows']):
+                        for c, spans in enumerate(row):
+                            self._md_write_spans(table.cellAt(r, c).firstCursorPosition(),
+                                                 spans, cell_fmt)
+                    for c, align in enumerate(blk['aligns']):
+                        set_table_column_alignment(table, c, align)
+                    # Qt always keeps one paragraph after a table (it
+                    # inherits the format of the block the table was
+                    # inserted into, hence the reset); the next block simply
+                    # goes into it.
+                    cursor.setPosition(table.lastPosition() + 1)
+                    cursor.setBlockFormat(QTextBlockFormat())
+                    cursor.setBlockCharFormat(base_fmt)
+                    fresh = True
+                    continue
 
-            if is_code_block:
-                if not (block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True):
-                    block_fmt.setProperty(BLOCK_CODE_PROP, True)
-                    temp_cursor.setBlockFormat(block_fmt)
-            else:
-                if not is_list and block_fmt.leftMargin() > 10:
-                    block_fmt.setProperty(QUOTE_PROP, True)
-                    block_fmt.setLeftMargin(15)
-                    temp_cursor.setBlockFormat(block_fmt)
+                bf = QTextBlockFormat()
+                cf = QTextCharFormat(base_fmt)
+                spans = blk.get('spans', [])
+                if kind == 'heading':
+                    bf.setHeadingLevel(blk['level'])
+                    if blk.get('setext'):
+                        bf.setProperty(SETEXT_PROP, True)
+                elif kind == 'quote':
+                    bf.setProperty(QUOTE_PROP, True)
+                    bf.setLeftMargin(15)
+                elif kind == 'hr':
+                    bf.setProperty(HR_PROP, True)
+                if fresh:
+                    cursor.setBlockFormat(bf)
+                    cursor.setBlockCharFormat(cf)
                 else:
-                    if block_fmt.hasProperty(QUOTE_PROP) and block_fmt.property(QUOTE_PROP) == True:
-                        block_fmt.setProperty(QUOTE_PROP, False)
-                        temp_cursor.setBlockFormat(block_fmt)
-                
-            block = next_block
+                    cursor.insertBlock(bf, cf)
+                fresh = False
+                if kind == 'list':
+                    cursor.insertText(blk['prefix'], base_fmt)
+                if spans:
+                    self._md_write_spans(cursor, spans, base_fmt)
+        finally:
+            cursor.endEditBlock()
 
-        # Empty lines right after a code block are exported as "<br>"s on
-        # their own line (a closing fence can't carry them). Qt reads such
-        # a line back as ONE block holding N line separators (N+1 visual
-        # lines), not as N empty blocks - turn it back into N empty blocks.
-        block = self.document().firstBlock()
-        while block.isValid():
-            prev = block.previous()
-            txt = block.text()
-            if (prev.isValid() and txt and set(txt) == {"\u2028"}
-                    and prev.blockFormat().hasProperty(BLOCK_CODE_PROP)
-                    and prev.blockFormat().property(BLOCK_CODE_PROP) == True
-                    and not QTextCursor(block).currentTable()):
-                n = len(txt)
-                c = QTextCursor(block)
-                c.movePosition(QTextCursor.StartOfBlock)
-                c.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-                c.removeSelectedText()
-                for _ in range(n - 1):
-                    c.insertBlock()
-                block = c.block()
-            block = block.next()
-
-        cursor.endEditBlock()
         self.apply_word_wrap()
-        
+        self.apply_settings_to_document(restore_cursor=False)
+        self.style_tables()
+
     def apply_settings_to_document(self, restore_cursor=True):
         orig_cursor = self.textCursor()
         char_updates = []
@@ -3713,6 +4716,10 @@ class Editor(QTextEdit):
             if block_fmt.lineHeightType() == QTextBlockFormat.FixedHeight.value:
                 new_block_fmt = QTextBlockFormat(block_fmt)
                 new_block_fmt.setLineHeight(0.0, QTextBlockFormat.SingleHeight.value)
+
+            _margin_fmt = QTextBlockFormat(new_block_fmt if new_block_fmt is not None else block_fmt)
+            if fit_setext_margin(_margin_fmt, self.settings):
+                new_block_fmt = _margin_fmt
 
             if is_block_code:
                 current_bg = block_fmt.background().color() if block_fmt.hasProperty(QTextFormat.BackgroundBrush) else QColor(Qt.transparent)
@@ -3790,8 +4797,9 @@ class Editor(QTextEdit):
                         fmt.setFontUnderline(self.settings.get("link_underline", True))
                         changed = True
                     elif level > 0:
-                        fmt.setForeground(QColor(self.settings[f"h{level}"]))
-                        size = self.settings.get(f"h{level}_size", 0)
+                        hkey = heading_style_key(block_fmt)
+                        fmt.setForeground(QColor(self.settings.get(hkey, self.settings[f"h{level}"])))
+                        size = self.settings.get(f"{hkey}_size", 0)
                         # 0 means "Default" in the Style Configuration dialog's
                         # spinbox. Falling back to the global font_size here
                         # would make every heading level the same size as
@@ -3997,12 +5005,102 @@ class EditorTabs(QTabWidget):
                 self.window().close_all_tabs()
 
 
+_SPIN_ICON_DIR = None
+
+def _spin_arrow_path(direction, color="#d0d0d0"):
+    """Small chevron PNG (up/down) for the dark spin-box style. Stylesheets can
+    only reference image files, so the two icons are drawn once into the temp
+    folder and reused."""
+    global _SPIN_ICON_DIR
+    import tempfile
+    if _SPIN_ICON_DIR is None:
+        _SPIN_ICON_DIR = os.path.join(tempfile.gettempdir(), "mpadplusplus_ui")
+        os.makedirs(_SPIN_ICON_DIR, exist_ok=True)
+    path = os.path.join(_SPIN_ICON_DIR, f"spin_{direction}_{color.strip('#')}.png")
+    if not os.path.exists(path):
+        pm = QPixmap(16, 16)
+        pm.fill(Qt.transparent)
+        pt = QPainter(pm)
+        pt.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(QColor(color), 1.8)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        pt.setPen(pen)
+        if direction == "up":
+            pt.drawPolyline([QPointF(4.5, 10), QPointF(8, 6), QPointF(11.5, 10)])
+        else:
+            pt.drawPolyline([QPointF(4.5, 6), QPointF(8, 10), QPointF(11.5, 6)])
+        pt.end()
+        pm.save(path, "PNG")
+    return path.replace("\\", "/")
+
+
+def _reset_icon_path(color="#d0d0d0"):
+    """Curved 'reset' arrow PNG for the reset-to-default buttons."""
+    _spin_arrow_path("up", color)    # makes sure the icon folder exists
+    path = os.path.join(_SPIN_ICON_DIR, f"reset_{color.strip('#')}.png")
+    if not os.path.exists(path):
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.transparent)
+        pt = QPainter(pm)
+        pt.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(QColor(color), 3.0)
+        pen.setCapStyle(Qt.RoundCap)
+        pt.setPen(pen)
+        # open circle, counter-clockwise, with the gap in the upper right...
+        pt.drawArc(QRectF(7, 7, 18, 18), 90 * 16, 250 * 16)
+        # ...and an arrow head on the loose end
+        pt.setBrush(QColor(color))
+        pt.setPen(Qt.NoPen)
+        pt.drawPolygon([QPointF(26.5, 8.5), QPointF(26.5, 18.0), QPointF(17.5, 14.0)])
+        pt.end()
+        pm.save(path, "PNG")
+    return path
+
+
+def dark_spinbox_stylesheet(accent="#0078d4"):
+    """Dark-grey look for QSpinBox (field, hover/focus border, arrow buttons)."""
+    up = _spin_arrow_path("up")
+    down = _spin_arrow_path("down")
+    return f"""
+        QSpinBox {{
+            background-color: #3a3a3a; color: #e6e6e6;
+            border: 1px solid #4d4d4d; border-radius: 4px;
+            padding: 2px 6px; min-height: 22px;
+            selection-background-color: #5a5a5a; selection-color: #ffffff;
+        }}
+        QSpinBox:hover {{ border-color: #6a6a6a; }}
+        QSpinBox:focus {{ border-color: {accent}; }}
+        QSpinBox::up-button, QSpinBox::down-button {{
+            subcontrol-origin: border; width: 20px;
+            background-color: #474747; border-left: 1px solid #4d4d4d;
+        }}
+        QSpinBox::up-button {{
+            subcontrol-position: top right;
+            border-top-right-radius: 3px; border-bottom: 1px solid #4d4d4d;
+        }}
+        QSpinBox::down-button {{
+            subcontrol-position: bottom right; border-bottom-right-radius: 3px;
+        }}
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background-color: #5a5a5a; }}
+        QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{ background-color: #2f2f2f; }}
+        QToolButton#resetButton {{
+            background-color: #3a3a3a; border: 1px solid #4d4d4d; border-radius: 4px;
+        }}
+        QToolButton#resetButton:hover {{ background-color: #4a4a4a; border-color: #6a6a6a; }}
+        QToolButton#resetButton:pressed {{ background-color: #2f2f2f; }}
+        QSpinBox::up-arrow {{ image: url({up}); width: 10px; height: 10px; }}
+        QSpinBox::down-arrow {{ image: url({down}); width: 10px; height: 10px; }}
+    """
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.setWindowIcon(get_app_icon())
         self.settings = settings.copy()
         self.setWindowTitle("Style Configuration - MPad++")
+        self.setStyleSheet(dark_spinbox_stylesheet(self.settings.get("tab_active_bar_color", "#0078d4")))
         self.setMinimumWidth(450)
         self.setMinimumHeight(500)
         
@@ -4015,7 +5113,9 @@ class SettingsDialog(QDialog):
         
         self.color_buttons = {}
         self.size_spins = {}
+        self.hu_line_spins = {}
 
+        self.add_section_header(layout, "Editor", first=True)
         self.add_color_picker(layout, "App Background", "app_bg")
         self.add_color_picker(layout, "Editor Background", "editor_bg")
         self.add_color_picker(layout, "Normal Text", "editor_text")
@@ -4025,6 +5125,7 @@ class SettingsDialog(QDialog):
         font_btn.clicked.connect(self.choose_font)
         layout.addRow("Global Font:", font_btn)
 
+        self.add_section_header(layout, "Text Formatting")
         elements = {
             "h1": ("Header H1", "h1_size", 72),
             "h2": ("Header H2", "h2_size", 72),
@@ -4032,6 +5133,8 @@ class SettingsDialog(QDialog):
             "h4": ("Header H4", "h4_size", 72),
             "h5": ("Header H5", "h5_size", 72),
             "h6": ("Header H6", "h6_size", 72),
+            "h1u": ("Header H1_ (underlined)", "h1u_size", 72),
+            "h2u": ("Header H2_ (underlined)", "h2u_size", 72),
             "bold": ("Bold", "bold_size", 72),
             "italic": ("Italic", "italic_size", 72),
             "underline": ("Underline", "underline_size", 72),
@@ -4044,33 +5147,51 @@ class SettingsDialog(QDialog):
         for key, (label_text, size_key, max_size) in elements.items():
             self.add_format_setting(layout, label_text, key, size_key, max_size)
 
+        self.add_section_header(layout, "Quote Line")
         self.add_color_picker(layout, "Quote (line)", "quote_line_color")
         
         self.quote_line_width_spin = QSpinBox()
         self.quote_line_width_spin.setRange(1, 20)
         self.quote_line_width_spin.setValue(self.settings.get("quote_line_width", 3))
         self.quote_line_width_spin.setSuffix(" px")
-        layout.addRow("Quote line thickness:", self.quote_line_width_spin)
+        self.add_spin_row(layout, "Quote line thickness:", self.quote_line_width_spin, "quote_line_width")
         
         self.underline_check = QCheckBox()
         self.underline_check.setChecked(self.settings.get("link_underline", True))
         layout.addRow("Underline hyperlink:", self.underline_check)
 
+        self.add_section_header(layout, "Underlined Headers")
+        for lvl in (1, 2):
+            self.add_color_picker(layout, f"Header H{lvl}_ (line)", f"h{lvl}u_line_color")
+            spin = QSpinBox()
+            spin.setRange(1, 20)
+            spin.setValue(self.settings.get(f"h{lvl}u_line_thickness", DEFAULT_SETTINGS[f"h{lvl}u_line_thickness"]))
+            spin.setSuffix(" px")
+            self.add_spin_row(layout, f"Header H{lvl}_ line thickness:", spin, f"h{lvl}u_line_thickness")
+            self.hu_line_spins[f"h{lvl}u_line_thickness"] = spin
+
+        self.setext_gap_spin = QSpinBox()
+        self.setext_gap_spin.setRange(0, 40)
+        self.setext_gap_spin.setValue(self.settings.get("setext_line_gap", DEFAULT_SETTINGS["setext_line_gap"]))
+        self.setext_gap_spin.setSuffix(" px")
+        self.add_spin_row(layout, "Header H1_/H2_ gap above line:", self.setext_gap_spin, "setext_line_gap")
+
+        self.add_section_header(layout, "Horizontal Line")
         self.add_color_picker(layout, "Horizontal Line", "hr_color")
 
         self.hr_thickness_spin = QSpinBox()
         self.hr_thickness_spin.setRange(1, 20)
         self.hr_thickness_spin.setValue(self.settings.get("hr_thickness", 2))
         self.hr_thickness_spin.setSuffix(" px")
-        layout.addRow("Horizontal line thickness:", self.hr_thickness_spin)
+        self.add_spin_row(layout, "Horizontal line thickness:", self.hr_thickness_spin, "hr_thickness")
 
-        layout.addRow(QLabel("--- Table Colors ---"))
+        self.add_section_header(layout, "Table Colors")
         self.add_color_picker(layout, "Header (background)", "table_header_bg")
         self.add_color_picker(layout, "Header (text)", "table_header_text")
         self.add_color_picker(layout, "Row 1 (background)", "table_row1_bg")
         self.add_color_picker(layout, "Row 2 (background)", "table_row2_bg")
 
-        layout.addRow(QLabel("--- Tab Colors ---"))
+        self.add_section_header(layout, "Tab Colors")
         self.add_color_picker(layout, "Active tab (background)", "tab_active_bg")
         self.add_color_picker(layout, "Inactive tab (background)", "tab_inactive_bg")
         self.add_color_picker(layout, "Active tab bar", "tab_active_bar_color")
@@ -4085,6 +5206,28 @@ class SettingsDialog(QDialog):
         
         self.setLayout(main_layout)
 
+    def add_section_header(self, layout, title, first=False):
+        """A styled group title spanning the whole row: accent bar on the left,
+        bold spaced-out capitals and a thin separator line underneath."""
+        accent = self.settings.get("tab_active_bar_color", "#0078d4")
+        holder = QWidget()
+        holder.setObjectName("sectionHeaderHolder")
+        holder.setStyleSheet("#sectionHeaderHolder { background: transparent; }")
+        hl = QVBoxLayout(holder)
+        hl.setContentsMargins(0, 4 if first else 16, 0, 4)
+        hl.setSpacing(4)
+        label = QLabel(title.upper())
+        label.setStyleSheet(
+            f"QLabel {{ color: {accent}; font-weight: bold; font-size: 9pt;"
+            f" letter-spacing: 1.5px; padding-left: 8px;"
+            f" border-left: 3px solid {accent}; background: transparent; }}")
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet("QFrame { background-color: rgba(128, 128, 128, 70); border: none; }")
+        hl.addWidget(label)
+        hl.addWidget(line)
+        layout.addRow(holder)
+
     def add_color_picker(self, layout, label_text, color_key):
         btn = QPushButton()
         btn.setFixedWidth(100)
@@ -4092,6 +5235,34 @@ class SettingsDialog(QDialog):
         btn.clicked.connect(lambda _, k=color_key, b=btn: self.pick_color(k, b))
         layout.addRow(label_text, btn)
         self.color_buttons[color_key] = btn
+
+    def _default_size(self, size_key):
+        """The size a text style really has by default: its own default, or -
+        for styles that follow the global font (stored as 0) - the global size."""
+        d = DEFAULT_SETTINGS.get(size_key, 0)
+        return d if d > 0 else self.settings["font_size"]
+
+    def _make_reset_button(self, tooltip, callback):
+        b = QToolButton()
+        b.setObjectName("resetButton")
+        b.setIcon(QIcon(_reset_icon_path()))
+        b.setIconSize(QSize(16, 16))
+        b.setToolTip(tooltip)
+        b.setFixedSize(28, 28)
+        b.setCursor(Qt.PointingHandCursor)
+        b.clicked.connect(callback)
+        return b
+
+    def add_spin_row(self, layout, label_text, spin, default_key):
+        """Form row: spin box (stretches) followed by a reset-to-default button."""
+        row = QWidget()
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addWidget(spin, 1)
+        hl.addWidget(self._make_reset_button(
+            "Reset to default",
+            lambda _=False, sp=spin, k=default_key: sp.setValue(DEFAULT_SETTINGS[k])))
+        layout.addRow(label_text, row)
 
     def add_format_setting(self, layout, label_text, color_key, size_key=None, max_size=72):
         btn = QPushButton()
@@ -4106,13 +5277,25 @@ class SettingsDialog(QDialog):
         
         if size_key is not None:
             spin = QSpinBox()
-            spin.setRange(0, max_size)
-            spin.setValue(self.settings.get(size_key, 0))
-            spin.setSpecialValueText("Default")
+            spin.setRange(1, max_size)
+            stored = self.settings.get(size_key, 0)
+            # 0 means "default"; show the real number instead of a word.
+            spin.setValue(stored if stored > 0 else self._default_size(size_key))
             row_layout.addWidget(QLabel("Size:"))
             row_layout.addWidget(spin)
             self.size_spins[size_key] = spin
-            
+
+            def reset_row(_=False, ck=color_key, sk=size_key, b=btn):
+                self.settings[ck] = DEFAULT_SETTINGS[ck]
+                b.setStyleSheet(f"background-color: {DEFAULT_SETTINGS[ck]};")
+                self.size_spins[sk].setValue(self._default_size(sk))
+
+            row_layout.addWidget(self._make_reset_button("Reset colour and size to default", reset_row))
+        else:
+            # No size box on this row: keep the colour button flush left so it
+            # lines up with every other colour button instead of floating.
+            row_layout.addStretch(1)
+
         layout.addRow(label_text, row_widget)
 
     def pick_color(self, key, btn):
@@ -4126,15 +5309,30 @@ class SettingsDialog(QDialog):
         dialog.setCurrentFont(QFont(self.settings["font_family"], self.settings["font_size"]))
         if dialog.exec():
             font = dialog.currentFont()
+            old_size = self.settings["font_size"]
             self.settings["font_family"] = font.family()
             self.settings["font_size"] = font.pointSize()
+            new_size = self.settings["font_size"]
+            if new_size > 0 and new_size != old_size:
+                # styles that follow the global font show (and keep following) it
+                for key, spin in self.size_spins.items():
+                    if DEFAULT_SETTINGS.get(key, 0) == 0 and spin.value() == old_size:
+                        spin.setValue(new_size)
 
     def accept(self):
         for key, spin in self.size_spins.items():
-            self.settings[key] = spin.value()
+            value = spin.value()
+            # a style that follows the global font and shows exactly that size
+            # keeps following it (stored as 0 = default) rather than freezing it
+            if DEFAULT_SETTINGS.get(key, 0) == 0 and value == self.settings["font_size"]:
+                value = 0
+            self.settings[key] = value
         self.settings["link_underline"] = self.underline_check.isChecked()
         self.settings["quote_line_width"] = self.quote_line_width_spin.value()
         self.settings["hr_thickness"] = self.hr_thickness_spin.value()
+        for key, spin in self.hu_line_spins.items():
+            self.settings[key] = spin.value()
+        self.settings["setext_line_gap"] = self.setext_gap_spin.value()
         super().accept()
 
     def get_settings(self):
@@ -4147,6 +5345,7 @@ class PreferencesDialog(QDialog):
         self.setWindowIcon(get_app_icon())
         self.settings = settings.copy()
         self.setWindowTitle("Preferences - MPad++")
+        self.setStyleSheet(dark_spinbox_stylesheet(self.settings.get("tab_active_bar_color", "#0078d4")))
         self.setMinimumWidth(400)
 
         outer_layout = QVBoxLayout(self)
@@ -4158,28 +5357,6 @@ class PreferencesDialog(QDialog):
         general_tab = QWidget()
         layout = QFormLayout(general_tab)
 
-        line_break_widget = QWidget()
-        line_break_layout = QVBoxLayout(line_break_widget)
-        line_break_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.line_break_group = QButtonGroup(line_break_widget)
-        self.line_break_radios = {}
-
-        line_break_options = [
-            ("br", "<br>"),
-            ("double_space", "[double space]"),
-            ("backslash", "\\ and enter"),
-        ]
-        current_line_break = self.settings.get("line_break_style", "double_space")
-        for value, label_text in line_break_options:
-            radio = QRadioButton(label_text)
-            if value == current_line_break:
-                radio.setChecked(True)
-            self.line_break_group.addButton(radio)
-            self.line_break_radios[value] = radio
-            line_break_layout.addWidget(radio)
-
-        layout.addRow("New line (character):", line_break_widget)
 
         # Default alignment every column of a newly inserted table starts
         # with (Insert > Table). Purely a starting point for brand-new
@@ -4353,11 +5530,6 @@ class PreferencesDialog(QDialog):
             item.setHidden(bool(query) and query not in item.text().lower())
 
     def accept(self):
-        for value, radio in self.line_break_radios.items():
-            if radio.isChecked():
-                self.settings["line_break_style"] = value
-                break
-
         self.settings["table_default_align"] = self.table_default_align_combo.currentData()
 
         for value, radio in self.startup_window_radios.items():
@@ -4621,17 +5793,24 @@ class FindReplaceDialog(QDialog):
         layout = QFormLayout(self)
 
         self.find_input = QLineEdit()
-        self.find_input.returnPressed.connect(self.find_next)
+        self.find_input.returnPressed.connect(self._on_enter)
         self.find_input.textChanged.connect(self._update_match_count)
         layout.addRow("Find:", self.find_input)
 
         self.replace_input = QLineEdit()
-        self.replace_input.returnPressed.connect(self.replace_current)
+        self.replace_input.returnPressed.connect(self._on_enter)
         layout.addRow("Replace with:", self.replace_input)
 
         self.case_check = QCheckBox("Case sensitive")
         self.case_check.toggled.connect(self._update_match_count)
         layout.addRow("", self.case_check)
+
+        # ENTER in either field = Find Next, or - with this ticked -
+        # Replace (replace the current match, then jump to the next one).
+        self.enter_replace_check = QCheckBox("ENTER to replace")
+        self.enter_replace_check.setChecked(bool(main_window.settings.get("find_enter_replaces", False)))
+        self.enter_replace_check.toggled.connect(self._on_enter_mode_toggled)
+        layout.addRow("", self.enter_replace_check)
 
         find_btn_row = QWidget()
         find_btn_layout = QHBoxLayout(find_btn_row)
@@ -4663,8 +5842,25 @@ class FindReplaceDialog(QDialog):
         btn_close.clicked.connect(self.close)
         layout.addRow(btn_close)
 
+        # ENTER is handled by the two input fields above; without this the
+        # dialog would additionally "press" whichever button Qt picked as
+        # its default one.
+        for b in self.findChildren(QPushButton):
+            b.setAutoDefault(False)
+            b.setDefault(False)
+
     def get_editor(self):
         return self.main_window.get_editor()
+
+    def _on_enter(self):
+        if self.enter_replace_check.isChecked():
+            self.replace_current()
+        else:
+            self.find_next()
+
+    def _on_enter_mode_toggled(self, checked):
+        self.main_window.settings["find_enter_replaces"] = bool(checked)
+        self.main_window.save_settings()
 
     def _flags(self, backward=False):
         flags = QTextDocument.FindFlags()
@@ -5047,6 +6243,17 @@ class MainWindow(QMainWindow):
             toolbar.addAction(action)
             self.h_actions[i] = action
 
+        # H1_ / H2_: the same headings, saved as "Title" over "===" / "---"
+        # and drawn with a line under them (own style in Settings).
+        self.hu_actions = {}
+        for i in (1, 2):
+            action = QAction(f"H{i}", self)
+            action.setCheckable(True)
+            action.setToolTip(f"Heading {i} with underline ({'===' if i == 1 else '---'} below the title)")
+            action.triggered.connect(lambda checked, x=i: self.toggle_heading(x, setext=True))
+            toolbar.addAction(action)
+            self.hu_actions[i] = action
+
         toolbar.addSeparator()
 
         self.act_bold = QAction("", self); self.act_bold.setCheckable(True)
@@ -5143,7 +6350,8 @@ class MainWindow(QMainWindow):
         for b in format_buttons:
             b.setToolButtonStyle(Qt.ToolButtonIconOnly)
 
-        h_buttons = [toolbar.widgetForAction(a) for a in self.h_actions.values()]
+        h_buttons = [toolbar.widgetForAction(a) for a in
+                     list(self.h_actions.values()) + list(self.hu_actions.values())]
         h_buttons = [b for b in h_buttons if b is not None]
 
         all_buttons = h_buttons + format_buttons
@@ -5151,6 +6359,12 @@ class MainWindow(QMainWindow):
             button_size = max(max(b.sizeHint().width(), b.sizeHint().height()) for b in all_buttons)
             for b in all_buttons:
                 b.setFixedSize(button_size, button_size)
+            for a in self.hu_actions.values():
+                b = toolbar.widgetForAction(a)
+                if b is not None:
+                    f = b.font()
+                    f.setUnderline(True)      # H1 / H2 with the title underlined
+                    b.setFont(f)
 
     def refresh_toolbar_icons(self):
         """(Re)apply SVG icons to the formatting toolbar, tinted to the
@@ -5296,535 +6510,8 @@ class MainWindow(QMainWindow):
 
     # --- Custom Markdown Export/Import ---
     def export_markdown(self, editor):
-        doc = editor.document()
-        cursor = QTextCursor(doc)
-        cursor.movePosition(QTextCursor.Start)
-        
-        md_lines = []
-        in_code_block = False
-        fence = "```"
-        # Index of the md_lines entry that is the closing fence. Nothing
-        # may be glued onto it (e.g. a "<br>" for a following empty
-        # block), or it stops being a valid closing fence.
-        fence_close_idx = -1
-        prev_was_quote = False
-
-        def pick_fence(start_block):
-            # Fence must be longer than any backtick run opening a line
-            # of the code content, otherwise that line ends the block.
-            longest = 0
-            b = start_block
-            while b.isValid():
-                bf = b.blockFormat()
-                if not (bf.hasProperty(BLOCK_CODE_PROP) and bf.property(BLOCK_CODE_PROP) == True):
-                    break
-                m = re.match(r'\s*(`+)', b.text())
-                if m:
-                    longest = max(longest, len(m.group(1)))
-                b = b.next()
-            return "`" * max(3, longest + 1)
-        # When the "<br>" line-break style bridges two adjacent plain
-        # paragraphs, the next block's text must be appended onto the
-        # SAME md_lines entry (no extra raw "\n" in between) - see the
-        # comment on needs_paragraph_break_marker() below for why.
-        pending_br_merge = False
-        # A genuinely empty plain block (the user just pressing Enter to
-        # leave a visible blank line) can't be written out as a literal
-        # blank raw-markdown line: CommonMark treats any run of one or
-        # more blank lines as exactly the same thing - a single paragraph
-        # break - so on the next import every blank line the user typed
-        # collapses away entirely, regardless of how many Enters they
-        # pressed. Instead, each empty block appends one "<br>" onto the
-        # END of the previous exported line. Qt's Markdown importer folds
-        # a trailing "<br/>" into the preceding block as a real U+2028
-        # line-separator character (confirmed to also work for multiple
-        # stacked "<br>"s, and even right after headings/quotes/lists/hr),
-        # so the blank line survives the round trip instead of vanishing.
-        # Once a real (non-empty) block is reached, the run is closed off
-        # with a normal blank-line separator before that block's own text -
-        # EXCEPT when the run sits at the very start of the document (no
-        # earlier line to attach the "<br>"s to yet, so they were appended
-        # as their own leading entry). There, a blank-line separator would
-        # actually add an unwanted extra blank line (Qt merges an isolated
-        # leading "<br/>...<br/>" HTML block into TWO empty sub-lines - one
-        # on each side of it - since it has no preceding text to attach to
-        # as a trailing break); gluing the next real line directly onto
-        # that same leading entry instead (reusing pending_br_merge) keeps
-        # the count exactly right.
-        pending_blank_run = False
-        pending_blank_leading = False
-
-        def ensure_blank_separator():
-            if md_lines and md_lines[-1] != "":
-                md_lines.append("")
-
-        def flush_pending_blank_run():
-            nonlocal pending_blank_run, pending_blank_leading, pending_br_merge
-            if pending_blank_run:
-                if pending_blank_leading:
-                    pending_br_merge = True
-                else:
-                    ensure_blank_separator()
-                pending_blank_run = False
-                pending_blank_leading = False
-
-        def needs_paragraph_break_marker(block):
-            # Two adjacent plain paragraph blocks (created by pressing
-            # Enter, not Shift+Enter) are joined below by a single '\n'
-            # with no blank line between them. CommonMark's "lazy
-            # continuation" rule means that, read back with no marker,
-            # they'd silently merge into one re-wrapped paragraph - so
-            # the configured hard-line-break style has to be applied
-            # here too, not just at Shift+Enter (U+2028) points.
-            #
-            # Special case for the "<br>" style: unlike the backslash
-            # and double-space CommonMark constructs (which consume the
-            # newline right after them as part of the break itself),
-            # "<br/>" is just inline raw HTML - a literal "\n" straight
-            # after it is parsed as a *separate*, ordinary soft line
-            # break, which renders as an extra leading space on the next
-            # line. So when "<br>" is selected, the next block's text is
-            # merged onto the same md_lines entry (pending_br_merge)
-            # instead of starting a new one, keeping the tag and the
-            # following text on the same raw source line.
-            next_block = block.next()
-            if not next_block.isValid():
-                return False
-            next_text = next_block.text()
-            if next_text == "":
-                return False
-            if QTextCursor(next_block).currentTable():
-                return False
-            next_fmt = next_block.blockFormat()
-            if next_fmt.headingLevel() > 0:
-                return False
-            if next_fmt.hasProperty(QUOTE_PROP) and next_fmt.property(QUOTE_PROP) == True:
-                return False
-            if next_fmt.hasProperty(HR_PROP) and next_fmt.property(HR_PROP) == True:
-                return False
-            if next_fmt.hasProperty(BLOCK_CODE_PROP) and next_fmt.property(BLOCK_CODE_PROP) == True:
-                return False
-            next_stripped = next_text.lstrip()
-            if next_stripped.startswith(("• ", "- ", "* ")):
-                return False
-            if len(next_stripped) > 2 and next_stripped[0].isdigit() and next_stripped[1] == '.' and next_stripped[2] == ' ':
-                return False
-            return True
-
-        def line_break_suffix():
-            style = self.settings.get("line_break_style", "double_space")
-            if style == "br":
-                # Written out exactly as "<br>" (no self-closing slash) so
-                # the saved file / Plain Text source matches what someone
-                # would naturally type by hand. preprocess_markdown()
-                # still upgrades it to the self-closing "<br/>" form
-                # in-memory, right before handing text to Qt's Markdown
-                # importer, since that's the only form Qt reliably reads
-                # back as a real line break - but that upgrade is never
-                # written back to disk, so the on-disk/Plain Text text
-                # stays "<br>".
-                return "<br>"
-            elif style == "backslash":
-                return "\\"
-            else:
-                return "  "
-
-        block = doc.firstBlock()
-        while block.isValid():
-            temp_cursor = QTextCursor(block)
-            table = temp_cursor.currentTable()
-            if table:
-                if block.position() == table.firstCursorPosition().block().position():
-                    if prev_was_quote:
-                        ensure_blank_separator()
-                        prev_was_quote = False
-                    flush_pending_blank_run()
-                    pending_br_merge = False
-                    self.export_table_to_md(table, md_lines)
-                    temp_cursor.setPosition(table.lastPosition() + 1)
-                    block = temp_cursor.block()
-                    continue
-                else:
-                    block = block.next()
-                    continue
-                    
-            text = block.text()
-            block_fmt = block.blockFormat()
-            
-            is_block_code = block_fmt.hasProperty(BLOCK_CODE_PROP) and block_fmt.property(BLOCK_CODE_PROP) == True
-            is_quote = block_fmt.hasProperty(QUOTE_PROP) and block_fmt.property(QUOTE_PROP) == True
-            is_hr = block_fmt.hasProperty(HR_PROP) and block_fmt.property(HR_PROP) == True
-            level = block_fmt.headingLevel()
-
-            # CommonMark "lazily" folds a line straight after a blockquote
-            # into that same blockquote paragraph unless a blank line
-            # closes it off first, so any transition out of a quote block
-            # needs one inserted.
-            if prev_was_quote and not is_quote:
-                ensure_blank_separator()
-            prev_was_quote = is_quote
-
-            # A plain, unformatted, empty block is the spacer line itself -
-            # it must NOT flush the run (it's what's accumulating it; see
-            # the "text == ''" branch far below). Everything else - real
-            # content of any kind, even a rare empty heading/quote/code
-            # line - closes the run off first.
-            is_plain_empty_spacer = (text == "" and not is_hr
-                                      and not is_block_code and level == 0
-                                      and not is_quote)
-            if not is_plain_empty_spacer:
-                flush_pending_blank_run()
-
-            if is_hr:
-                pending_br_merge = False
-                if in_code_block:
-                    md_lines.append(fence)
-                    fence_close_idx = len(md_lines) - 1
-                    in_code_block = False
-                # A bare "---" only reads back as a thematic break (rather
-                # than a Setext heading underline for whatever text came
-                # right before it) when it sits on its own blank-line-
-                # delimited paragraph.
-                ensure_blank_separator()
-                md_lines.append("---")
-                md_lines.append("")
-                block = block.next()
-                continue
-
-            if is_block_code:
-                pending_br_merge = False
-                if not in_code_block:
-                    fence = pick_fence(block)
-                    md_lines.append(fence)
-                    in_code_block = True
-                md_lines.append(text)
-                block = block.next()
-                continue
-            else:
-                if in_code_block:
-                    md_lines.append(fence)
-                    fence_close_idx = len(md_lines) - 1
-                    in_code_block = False
-                    
-            if level > 0:
-                pending_br_merge = False
-                md_lines.append("#" * level + " " + self.get_inline_md(block))
-            elif is_quote:
-                pending_br_merge = False
-                md_lines.append("> " + self.get_inline_md(block))
-            else:
-                stripped = text.lstrip()
-                prefix = ""
-                skip = 0
-                if stripped.startswith("• "):
-                    prefix = "- "
-                    skip = 2
-                elif stripped.startswith("- ") or stripped.startswith("* "):
-                    prefix = "- "
-                    skip = 2
-                elif len(stripped) > 2 and stripped[0].isdigit() and stripped[1] == '.' and stripped[2] == ' ':
-                    prefix = stripped[:3]
-                    skip = 3
-                    
-                if prefix:
-                    pending_br_merge = False
-                    md_lines.append(prefix + self.get_inline_md(block, skip))
-                else:
-                    if text == "":
-                        pending_br_merge = False
-                        if md_lines and len(md_lines) - 1 != fence_close_idx:
-                            md_lines[-1] += "<br>"
-                        elif md_lines:
-                            # previous line is a closing fence: keep it
-                            # intact, put the break on its own line
-                            ensure_blank_separator()
-                            md_lines.append("<br>")
-                            pending_blank_leading = True
-                        else:
-                            md_lines.append("<br>")
-                            pending_blank_leading = True
-                        pending_blank_run = True
-                    else:
-                        line = self.get_inline_md(block)
-                        if pending_br_merge:
-                            md_lines[-1] += line
-                        else:
-                            md_lines.append(line)
-                        pending_br_merge = False
-
-                        if needs_paragraph_break_marker(block):
-                            style = self.settings.get("line_break_style", "double_space")
-                            if style == "br":
-                                md_lines[-1] += "<br>"
-                                pending_br_merge = True
-                            else:
-                                md_lines[-1] += line_break_suffix()
-                        
-            block = block.next()
-            
-        if in_code_block:
-            md_lines.append(fence)
-            
-        return "\n".join(md_lines)
-
-    def export_table_to_md(self, table, md_lines):
-        rows = table.rows()
-        cols = table.columns()
-        
-        header = []
-        for c in range(cols):
-            cell = table.cellAt(0, c)
-            cursor = cell.firstCursorPosition()
-            cursor.setPosition(cell.lastCursorPosition().position(), QTextCursor.KeepAnchor)
-            header.append(cursor.selectedText().replace('\n', ' '))
-        md_lines.append("| " + " | ".join(header) + " |")
-
-        sep_markers = {"left": "---", "center": ":---:", "right": "---:"}
-        sep = [sep_markers.get(get_table_column_alignment(table, c), "---") for c in range(cols)]
-        md_lines.append("| " + " | ".join(sep) + " |")
-        
-        for r in range(1, rows):
-            row_data = []
-            for c in range(cols):
-                cell = table.cellAt(r, c)
-                cursor = cell.firstCursorPosition()
-                cursor.setPosition(cell.lastCursorPosition().position(), QTextCursor.KeepAnchor)
-                row_data.append(cursor.selectedText().replace('\n', ' '))
-            md_lines.append("| " + " | ".join(row_data) + " |")
-
-    def get_inline_md(self, block, skip_chars=0):
-        result = ""
-        level = block.blockFormat().headingLevel()
-        is_quote = block.blockFormat().hasProperty(QUOTE_PROP) and block.blockFormat().property(QUOTE_PROP) == True
-        
-        it = block.begin()
-        while not it.atEnd():
-            frag = it.fragment()
-            if frag.isValid() and frag.length() > 0:
-                text = frag.text()
-                if skip_chars > 0:
-                    if len(text) <= skip_chars:
-                        skip_chars -= len(text)
-                        continue
-                    else:
-                        text = text[skip_chars:]
-                        skip_chars = 0
-                        
-                if not text:
-                    continue
-
-                fmt = frag.charFormat()
-                is_code = fmt.hasProperty(CODE_PROP) and fmt.property(CODE_PROP) == True
-                is_anchor = fmt.isAnchor()
-                is_bold = fmt.fontWeight() == QFont.Bold
-                is_italic = fmt.fontItalic()
-                is_underline = fmt.fontUnderline()
-
-                if fmt.objectType() == MEDIA_OBJECT_TYPE:
-                    alt = fmt.property(MEDIA_ALT_PROP) or ""
-                    src = fmt.property(MEDIA_SRC_PROP) or ""
-                    piece = f"![{self.escape_md_text(alt)}]({src})"
-                elif is_code:
-                    piece = f"`{text}`"
-                elif is_anchor:
-                    piece = f"[{self.escape_md_text(text)}]({fmt.anchorHref()})"
-                else:
-                    # Any of these characters, typed as literal text rather
-                    # than intended as markup, would otherwise be misread
-                    # as real Markdown syntax on reload (turning a literal
-                    # "*note*" into italics, a stray "_" into an
-                    # underscore-emphasis marker, "<tag>" into raw HTML,
-                    # etc.) - escaping them here keeps plain typed text
-                    # showing up as plain text, both in the Plain Text view
-                    # and after switching back to Formatted.
-                    tmp = self.escape_md_text(text)
-                    if is_bold and level == 0:
-                        tmp = f"**{tmp}**"
-                    if is_italic and level == 0 and not is_quote:
-                        tmp = f"*{tmp}*"
-                    if is_underline:
-                        tmp = f"<u>{tmp}</u>"
-                    piece = tmp
-
-                # Shift+Enter inserts a U+2028 LINE SEPARATOR inside the
-                # current block rather than starting a new one. Left as-is
-                # it's an invisible character that Markdown (and most text
-                # editors) don't understand, so a shift+enter line break
-                # would silently vanish on save/reload. Turn it into
-                # whichever hard-line-break syntax is configured in
-                # Settings > Preferences so it survives the round trip -
-                # it comes back as a normal line break on reopen.
-                #
-                # This substitution happens *after* escape_md_text() above,
-                # not before: escaping runs over whatever literal text the
-                # user typed, and U+2028 itself is never part of that
-                # escape-char set, so it passes through untouched either
-                # way. Doing the replacement first (on `text`) used to mean
-                # the freshly-inserted "<br/>" (or backslash) got escaped
-                # right along with it, turning it into a literal
-                # "\<br/\>" that Qt's Markdown reader doesn't recognize as
-                # a tag at all - it showed up as visible backslash-escaped
-                # text in the reopened document instead of an actual line
-                # break.
-                if '\u2028' in piece:
-                    style = self.settings.get("line_break_style", "double_space")
-                    if style == "br":
-                        # Written out exactly as "<br>" - preprocess_markdown()
-                        # is what upgrades a bare "<br>" to the self-closing
-                        # "<br/>" form Qt's importer needs, but only
-                        # in-memory right before parsing, never back to the
-                        # saved file/Plain Text source. This is also the
-                        # only one of the three styles that reopens as a
-                        # genuine same-block soft break (mirroring the
-                        # original Shift+Enter).
-                        #
-                        # No trailing "\n" here (unlike the other two
-                        # styles below): a literal newline right after
-                        # "<br>" isn't consumed as part of the tag the
-                        # way it is for the backslash/double-space hard-
-                        # break constructs - it's parsed as a *separate*
-                        # ordinary soft break, which would add a spurious
-                        # leading space to the next line on reload.
-                        replacement = "<br>"
-                    elif style == "backslash":
-                        # CommonMark hard break. Reopens as two separate
-                        # blocks/paragraphs rather than one block with an
-                        # internal soft break - visually identical, but
-                        # worth knowing if later code walks blocks.
-                        replacement = "\\\n"
-                    else:
-                        # CommonMark hard break (two trailing spaces).
-                        # Same two-block caveat as the backslash style above.
-                        replacement = "  \n"
-                    piece = piece.replace('\u2028', replacement)
-
-                result += piece
-            it += 1
-        return result
-
-    # Previously this backslash-escaped literal Markdown-special characters
-    # (\ ` * _ [ ] < > ~ |) in plain typed text before export, so they'd
-    # read back as the exact same literal characters instead of being
-    # reinterpreted as emphasis, code spans, links, or raw HTML. Disabled
-    # on request, to match how other editors export - typed text is now
-    # written out as-is. Trade-off: a literally typed "*note*", "_x_",
-    # "<tag>", etc. can be reinterpreted as real Markdown syntax the next
-    # time the file is reopened.
-    MD_ESCAPE_CHARS = r'\`*_[]<>~|'
-
-    def escape_md_text(self, text):
-        return text
-
-    # --- File Operations ---
-    def isolate_structural_lines(self, content):
-        """Make block boundaries explicit so the importer never depends on
-        the user having typed blank lines. A fenced code block always gets
-        a blank line before its opening fence and after its closing fence,
-        and a lone '<br>' line (which CommonMark reads as an HTML block
-        that swallows every following line up to the next blank line,
-        including fences) is closed off with a blank line too. Fence
-        content is never touched."""
-        out = []
-        fence_state = None
-        after_close = False
-        lone_br_re = re.compile(r'^\s*\\?<br\s*/?\\?>\s*$')
-        prev_lone_br = False
-        for line in content.split('\n'):
-            if fence_state:
-                fence_state, _ = md_fence_step(line, fence_state)
-                out.append(line)
-                if fence_state is None:
-                    after_close = True
-                continue
-            new_state, is_open = md_fence_step(line, None)
-            blank = line.strip() == ''
-            if out and out[-1].strip() != '':
-                if is_open or ((after_close or prev_lone_br) and not blank):
-                    out.append('')
-            after_close = False
-            prev_lone_br = bool(lone_br_re.match(line))
-            out.append(line)
-            fence_state = new_state
-        return '\n'.join(out)
-
-    def preprocess_markdown(self, content):
-        content = self.isolate_structural_lines(content)
-        lines = content.split('\n')
-        new_lines = []
-        prev_type = 'normal'
-        fence_state = None
-
-        for line in lines:
-            stripped = line.lstrip()
-
-            if fence_state:
-                fence_state, _ = md_fence_step(line, fence_state)
-                new_lines.append(line)
-                prev_type = 'code'
-                continue
-
-            # Normalize the recognized hard-line-break tag before Qt's
-            # own Markdown importer ever sees it. Qt's importer only
-            # reliably turns a self-closing "<br/>" into a real in-
-            # paragraph line break; a bare "<br>" (no closing slash)
-            # makes it drop the rest of that paragraph on load instead.
-            # The primary symbol looked for on read is the bare "<br>"
-            # (matching what someone would naturally type by hand), and
-            # the self-closing "<br/>" is also recognized as an
-            # alternate - both are rewritten here to the self-closing
-            # form so either one reopens correctly. Left alone inside
-            # fenced code blocks (handled above) so example HTML isn't
-            # rewritten.
-            #
-            # Also tolerates the backslash-escaped "\<br/\>" that older
-            # versions of this app used to write (a since-fixed export
-            # bug used to run "<" and ">" through Markdown-escaping
-            # *after* inserting the literal "<br/>" tag, corrupting it).
-            # Files saved back then have that broken form baked in on
-            # disk; this normalizes it back to a real line break too so
-            # such files self-heal on open instead of showing literal
-            # "<br/>" text forever.
-            line = re.sub(r'\\?<br\s*/?\\?>', '<br/>', line)
-            stripped = line.lstrip()
-
-            fence_state, is_fence_line = md_fence_step(line, None)
-            if is_fence_line:
-                current_type = 'code'
-            elif stripped.startswith('> '):
-                current_type = 'quote'
-            elif stripped.startswith('#'):
-                current_type = 'header'
-            elif re.fullmatch(r'-{1,}\s*', stripped) or re.fullmatch(r'={1,}\s*', stripped):
-                # A run of "-" or "=" directly under a text line is what
-                # CommonMark reads as a Setext heading underline (H2/H1),
-                # not a horizontal rule - so a line like this left over
-                # from an older save (or a hand-edited file) would
-                # silently swallow the paragraph above it into a heading.
-                # This app only ever writes headings as "#"/"##" ATX
-                # syntax, so any such underline is forced onto its own
-                # blank-line-delimited paragraph below, which reads back
-                # as a horizontal rule (or, for "=", inert plain text)
-                # instead.
-                current_type = 'hr_underline'
-            elif stripped.startswith(('- ', '* ', '• ')) or (
-                    len(stripped) > 2 and stripped[0].isdigit()
-                    and stripped[1] == '.' and stripped[2] == ' '):
-                current_type = 'list'
-            else:
-                current_type = 'normal'
-
-            if current_type != prev_type:
-                if current_type in ('quote', 'header', 'hr_underline') or prev_type in ('quote', 'header'):
-                    if new_lines and new_lines[-1].strip() != '':
-                        new_lines.append('')
-
-            new_lines.append(line)
-            if line.strip() == '':
-                prev_type = 'normal'
-            else:
-                prev_type = current_type
-
-        return '\n'.join(new_lines)
+        """The document as Markdown source (see md_serialize)."""
+        return md_serialize(editor)
 
     def open_file_dialog(self, in_new_tab=False):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open File", "", "Markdown (*.md);;Text files (*.txt)")
@@ -5889,20 +6576,18 @@ class MainWindow(QMainWindow):
 
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            content = self.preprocess_markdown(content)
+            # The newline that terminates the last line is not a line of
+            # its own (save_file writes exactly one).
+            if content.endswith("\n"):
+                content = content[:-1]
 
             editor.document().setUndoRedoEnabled(False)
             editor.setExtraSelections([])
             editor.spell_highlighter.begin_bulk_load()
             try:
-                editor.document().setMarkdown(content, QTextDocument.MarkdownDialectGitHub)
-                apply_markdown_table_alignments(editor.document(), parse_markdown_table_alignments(content))
                 editor.current_file = file_path
                 editor.view_mode = "formatted"
-                editor.replace_media_placeholders(extract_media_alt_map(content))
-                editor.post_process_markdown()
-                editor.style_tables()
-                editor.apply_settings_to_document(restore_cursor=False)
+                editor.load_markdown(content)
                 editor.document().setModified(False)
             finally:
                 editor.spell_highlighter.end_bulk_load()
@@ -5949,7 +6634,7 @@ class MainWindow(QMainWindow):
         try:
             markdown_content = self.export_markdown(editor)
             with open(editor.current_file, 'w', encoding='utf-8') as f:
-                f.write(markdown_content)
+                f.write(markdown_content + "\n")
             editor.document().setModified(False)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Cannot save file:\n{str(e)}")
@@ -6237,7 +6922,7 @@ class MainWindow(QMainWindow):
             touched = True
         return touched
 
-    def toggle_heading(self, level):
+    def toggle_heading(self, level, setext=False):
         editor = self.get_editor()
         if not editor: return
         cursor = editor.textCursor()
@@ -6266,7 +6951,11 @@ class MainWindow(QMainWindow):
             end_block = doc.findBlock(end)
             end_block_number = end_block.blockNumber()
 
-            toggle_off = (start_block.blockFormat().headingLevel() == level)
+            setext = bool(setext) and level in (1, 2)
+            start_fmt = start_block.blockFormat()
+            toggle_off = (start_fmt.headingLevel() == level
+                          and is_setext_block(start_fmt) == setext)
+            hkey = "h%du" % level if setext else "h%d" % level
 
             # Same for every block touched by this call (one toggle_off/
             # level per call, not per block) - computed once instead of
@@ -6277,13 +6966,13 @@ class MainWindow(QMainWindow):
                 char_fmt.setForeground(QColor(self.settings["editor_text"]))
                 char_fmt.setFontWeight(QFont.Normal)
             else:
-                size = self.settings.get(f"h{level}_size", 0)
+                size = self.settings.get(f"{hkey}_size", 0)
                 # See apply_settings_to_document() for why this falls
                 # back to the heading level's own default size (not the
                 # global font_size) when sized at "Default" (0).
                 if size == 0: size = DEFAULT_SETTINGS.get(f"h{level}_size", self.settings["font_size"])
                 char_fmt.setFontPointSize(size)
-                char_fmt.setForeground(QColor(self.settings[f"h{level}"]))
+                char_fmt.setForeground(QColor(self.settings.get(hkey, self.settings[f"h{level}"])))
                 char_fmt.setFontWeight(QFont.Bold)
 
             block = start_block
@@ -6297,6 +6986,14 @@ class MainWindow(QMainWindow):
 
                 block_fmt = block_cursor.blockFormat()
                 block_fmt.setHeadingLevel(0 if toggle_off else level)
+                if setext and not toggle_off:
+                    block_fmt.setProperty(SETEXT_PROP, True)
+                else:
+                    block_fmt.clearProperty(SETEXT_PROP)
+                if toggle_off:
+                    block_fmt.setBottomMargin(0)
+                else:
+                    fit_setext_margin(block_fmt, self.settings)
 
                 block_cursor.setBlockFormat(block_fmt)
                 # See _apply_char_format_to_block()'s docstring for why this
@@ -6522,22 +7219,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             rows, cols = dialog.get_data()
             cursor = editor.textCursor()
-            # A bare insertTable(rows, cols) leaves every column's width
-            # unconstrained, so Qt shrinks empty columns down to ~0px - the
-            # table renders as a sliver of stacked cell backgrounds/borders
-            # instead of a real grid. Explicitly stretch columns to share
-            # the available width equally, and give cells padding/borders
-            # so they're visible even before any text is typed into them.
-            fmt = QTextTableFormat()
-            fmt.setCellPadding(6)
-            fmt.setCellSpacing(0)
-            fmt.setBorder(1)
-            fmt.setBorderStyle(QTextFrameFormat.BorderStyle_Solid)
-            fmt.setBorderBrush(QColor("#555555"))
-            fmt.setColumnWidthConstraints(
-                [QTextLength(QTextLength.VariableLength, 0)] * cols
-            )
-            cursor.insertTable(rows, cols, fmt)
+            cursor.insertTable(rows, cols, editor.make_table_format(cols))
             table = cursor.currentTable()
             default_align = self.settings.get("table_default_align", "left")
             if default_align != "left" and table:
@@ -6931,11 +7613,15 @@ class MainWindow(QMainWindow):
         block_fmt = cursor.blockFormat()
         line_text = cursor.block().text().strip()
         
+        for i, act in self.hu_actions.items():
+            act.blockSignals(True)
+            act.setChecked(block_fmt.headingLevel() == i and is_setext_block(block_fmt))
+            act.blockSignals(False)
         for i in range(1, 7):
             self.h_actions[i].blockSignals(True)
-            self.h_actions[i].setChecked(block_fmt.headingLevel() == i)
+            self.h_actions[i].setChecked(block_fmt.headingLevel() == i and not is_setext_block(block_fmt))
             self.h_actions[i].blockSignals(False)
-            
+
         self.act_bold.blockSignals(True)
         self.act_italic.blockSignals(True)
         self.act_underline.blockSignals(True)
@@ -6996,7 +7682,7 @@ class MainWindow(QMainWindow):
         is_plain = bool(editor) and editor.view_mode == "plain"
         actions = [self.act_bold, self.act_italic, self.act_underline, self.act_code,
                    self.act_quote, self.act_ul, self.act_ol, self.act_table,
-                   self.act_hr, self.act_link, self.act_media] + list(self.h_actions.values())
+                   self.act_hr, self.act_link, self.act_media] + list(self.h_actions.values()) + list(self.hu_actions.values())
         for action in actions:
             action.setEnabled(not is_plain)
 
@@ -7066,17 +7752,10 @@ class MainWindow(QMainWindow):
                 # sitting on characters that looked plain on screen.
                 select_cursor.setCharFormat(flat_fmt)
             else:
-                # Route back through the same normalization used for File >
-                # Open (currently: <br>/<br/> line-break-tag handling), so
-                # raw markdown typed or edited by hand in plain-text mode
-                # reads back the same way a saved-and-reopened file would.
-                text = self.preprocess_markdown(editor.toPlainText())
-                editor.document().setMarkdown(text, QTextDocument.MarkdownDialectGitHub)
-                apply_markdown_table_alignments(editor.document(), parse_markdown_table_alignments(text))
-                editor.replace_media_placeholders(extract_media_alt_map(text))
-                editor.post_process_markdown()
-                editor.apply_settings_to_document(restore_cursor=False)
-                editor.style_tables()
+                # Same engine as File > Open, so raw markdown typed or edited
+                # by hand in plain-text mode reads back exactly the way a
+                # saved-and-reopened file would.
+                editor.load_markdown(editor.toPlainText())
         except Exception as e:
             editor.spell_highlighter.end_bulk_load()
             # A failure partway through must never leave the document stuck
