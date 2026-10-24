@@ -146,8 +146,20 @@ def _legacy_settings_path():
     return os.path.join(folder, "mpad_settings.json")
 
 
+# Guiding (accent) colour of the app: checked toolbar buttons, active tab bar,
+# focus / default-button borders, checkboxes and radio buttons. The text styles
+# (headings, links) have their own, lighter teal so they stay readable on dark.
+DEFAULT_ACCENT = "#306c6d"
+OLD_BLUE_TO_TEAL = {          # untouched old defaults are migrated, custom colours are kept
+    "#569cd6": "#52b4b5",     # headings
+    "#3794ff": "#63c5c6",     # hyperlinks
+    "#007acc": DEFAULT_ACCENT,# active tab bar
+    "#673ab7": DEFAULT_ACCENT # table header background (old purple default)
+}
+
 # --- Default settings ---
 DEFAULT_SETTINGS = {
+    "accent_color": DEFAULT_ACCENT,
     "app_bg": "#272727",
     "app_text": "#d4d4d4",
     "editor_bg": "#2d2d2d",
@@ -156,12 +168,12 @@ DEFAULT_SETTINGS = {
     "font_family": "Consolas",
     "font_size": 12,
     
-    "h1": "#569cd6", "h1_size": 24,
-    "h2": "#569cd6", "h2_size": 20,
-    "h3": "#569cd6", "h3_size": 18,
-    "h4": "#569cd6", "h4_size": 16,
-    "h5": "#569cd6", "h5_size": 14,
-    "h6": "#569cd6", "h6_size": 13,
+    "h1": "#52b4b5", "h1_size": 24,
+    "h2": "#52b4b5", "h2_size": 20,
+    "h3": "#52b4b5", "h3_size": 18,
+    "h4": "#52b4b5", "h4_size": 16,
+    "h5": "#52b4b5", "h5_size": 14,
+    "h6": "#52b4b5", "h6_size": 13,
     "bold": "#ce9178", "bold_size": 0,
     "italic": "#c586c0", "italic_size": 0,
     "underline": "#dcdcaa", "underline_size": 0,
@@ -181,14 +193,15 @@ DEFAULT_SETTINGS = {
 
     # Underlined headings (Title over === / ---): their own text style and
     # the line drawn under them. Buttons H1_ / H2_.
-    "h1u": "#569cd6", "h1u_size": 24,
-    "h2u": "#569cd6", "h2u_size": 20,
-    "h1u_line_color": "#3d444d", "h1u_line_thickness": 1,
-    "h2u_line_color": "#3d444d", "h2u_line_thickness": 1,
-    "link": "#3794ff", "link_size": 0,
+    "h1u": "#52b4b5", "h1u_size": 24,
+    "h2u": "#52b4b5", "h2u_size": 20,
+    # Default line colour = the heading's own text colour (h1u / h2u above).
+    "h1u_line_color": "#52b4b5", "h1u_line_thickness": 1,
+    "h2u_line_color": "#52b4b5", "h2u_line_thickness": 1,
+    "link": "#63c5c6", "link_size": 0,
     "link_underline": True,
     
-    "table_header_bg": "#673AB7",
+    "table_header_bg": DEFAULT_ACCENT,   # guiding colour by default
     "table_header_text": "#FFFFFF",
     "table_row1_bg": "#252526",
     "table_row2_bg": "#2d2d2d",
@@ -201,7 +214,7 @@ DEFAULT_SETTINGS = {
     
     "tab_active_bg": "#2d2d2d",
     "tab_inactive_bg": "#1e1e1e",
-    "tab_active_bar_color": "#007acc",
+    "tab_active_bar_color": DEFAULT_ACCENT,
 
     # Edit > Word Wrap. When on, long lines (including lines inside code
     # blocks) wrap at the editor's width instead of scrolling sideways.
@@ -2587,13 +2600,7 @@ class Editor(QTextEdit):
         self.table_btn = QToolButton(self)
         self.table_btn.setText("⚙")
         self.table_btn.setToolTip("Edit Table")
-        self.table_btn.setStyleSheet("""
-            QToolButton {
-                background-color: #007acc; color: white; border: none;
-                border-radius: 5px; padding: 5px; font-size: 16px; font-weight: bold;
-            }
-            QToolButton:hover { background-color: #1a8cff; }
-        """)
+        self._style_table_button()
         self.table_btn.setFixedSize(32, 32)
         self.table_btn.hide()
         self.table_btn.clicked.connect(self.window().open_table_editor)
@@ -2770,6 +2777,16 @@ class Editor(QTextEdit):
             doc.setModified(was_modified)
         self.viewport().update()
 
+    def _style_table_button(self):
+        accent = QColor(self.settings.get("accent_color", DEFAULT_ACCENT))
+        self.table_btn.setStyleSheet(f"""
+            QToolButton {{
+                background-color: {accent.name()}; color: white; border: none;
+                border-radius: 5px; padding: 5px; font-size: 16px; font-weight: bold;
+            }}
+            QToolButton:hover {{ background-color: {accent.lighter(125).name()}; }}
+        """)
+
     def apply_word_wrap(self):
         """Apply the Edit > Word Wrap setting to this editor. Qt's Markdown
         importer marks fenced-code blocks as non-breakable, so after a
@@ -2792,6 +2809,8 @@ class Editor(QTextEdit):
         self.viewport().update()
 
     def apply_settings(self):
+        if hasattr(self, "table_btn"):
+            self._style_table_button()
         self.apply_word_wrap()
         self.setStyleSheet(f"QTextEdit {{ background-color: {self.settings['editor_bg']}; color: {self.settings['editor_text']}; border: none; }}")
         font = QFont(self.settings["font_family"], self.settings["font_size"])
@@ -3582,7 +3601,7 @@ class Editor(QTextEdit):
         painter.setBrush(QColor("#444444"))
         painter.drawRoundedRect(progress_rect, 2, 2)
         frac = ctrl.position_fraction()
-        painter.setBrush(QColor(self.settings.get("link", "#3794ff")))
+        painter.setBrush(QColor(self.settings.get("link", "#63c5c6")))
         painter.drawRoundedRect(QRectF(progress_rect.left(), progress_rect.top(),
                                         progress_rect.width() * frac, progress_rect.height()), 2, 2)
 
@@ -3603,7 +3622,7 @@ class Editor(QTextEdit):
         ctrl = self.get_media_controller(media_id, "audio", resolved, is_remote)
 
         icon_circle = QRectF(rect.left() + 8, rect.top() + rect.height() / 2 - 14, 28, 28)
-        painter.setBrush(QColor(self.settings.get("link", "#3794ff")))
+        painter.setBrush(QColor(self.settings.get("link", "#63c5c6")))
         painter.drawEllipse(icon_circle)
         painter.setPen(QColor("#ffffff"))
         f = painter.font(); f.setPointSize(11); painter.setFont(f)
@@ -3627,7 +3646,7 @@ class Editor(QTextEdit):
         painter.setBrush(QColor("#4a4a4a"))
         painter.drawRoundedRect(progress_rect, 2, 2)
         frac = ctrl.position_fraction()
-        painter.setBrush(QColor(self.settings.get("link", "#3794ff")))
+        painter.setBrush(QColor(self.settings.get("link", "#63c5c6")))
         painter.drawRoundedRect(QRectF(progress_rect.left(), progress_rect.top(),
                                         progress_rect.width() * frac, progress_rect.height()), 2, 2)
 
@@ -4867,6 +4886,49 @@ class Editor(QTextEdit):
             else:
                 if not cursor.movePosition(QTextCursor.NextBlock): break
 
+    def _clear_stale_cell_text_colors(self, cell):
+        """Text typed/loaded into a cell can keep its own copy of the cell's
+        colours from that moment (e.g. the old header background as a
+        highlight behind the letters), so a changed table colour only reached
+        the cell, not the text. Strip those copies so the text follows the
+        cell format again. Links and inline code keep their own colours.
+        Only text fragments are touched - never the block's own format,
+        which Qt shares with the cell and would wipe the cell background."""
+        doc = self.document()
+        code_bg = QColor(self.settings.get('code_bg', '#000000'))
+        start = cell.firstPosition()
+        end = cell.lastPosition()
+        fixes = []          # (position, length, QTextCharFormat)
+        block = doc.findBlock(start)
+        while block.isValid() and block.position() <= end:
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    cf = frag.charFormat()
+                    is_code = (cf.hasProperty(QTextFormat.BackgroundBrush)
+                               and cf.background().color() == code_bg)
+                    if (not cf.isAnchor() and not is_code
+                            and (cf.hasProperty(QTextFormat.BackgroundBrush)
+                                 or cf.hasProperty(QTextFormat.ForegroundBrush))):
+                        nf = QTextCharFormat(cf)
+                        nf.clearBackground()
+                        nf.clearForeground()
+                        fixes.append((frag.position(), frag.length(), nf))
+                it += 1
+            block = block.next()
+        if not fixes:
+            return
+        was_modified = doc.isModified()
+        cur = QTextCursor(doc)
+        cur.beginEditBlock()
+        for pos, length, nf in fixes:
+            cur.setPosition(pos)
+            cur.setPosition(pos + length, QTextCursor.KeepAnchor)
+            cur.setCharFormat(nf)
+        cur.endEditBlock()
+        doc.setModified(was_modified)
+
     def apply_table_style(self, table):
         rows = table.rows()
         cols = table.columns()
@@ -4920,6 +4982,7 @@ class Editor(QTextEdit):
                     fmt.setForeground(QColor(self.settings['editor_text']))
                     fmt.setFontWeight(QFont.Normal)
                 cell.setFormat(fmt)
+                self._clear_stale_cell_text_colors(cell)
                 # Text alignment is left untouched here - it's real
                 # per-column Markdown alignment (see set_table_column_alignment()),
                 # already applied to each cell directly, not something this
@@ -5035,6 +5098,41 @@ def _spin_arrow_path(direction, color="#d0d0d0"):
     return path.replace("\\", "/")
 
 
+def accent_text_color(accent):
+    """A lighter variant of the accent colour, readable as text on a dark background."""
+    c = QColor(accent)
+    if c.lightness() >= 150:
+        return c.name()
+    h, sat, _l, _a = c.getHsl()
+    out = QColor()
+    out.setHsl(max(h, 0), sat, 160)
+    return out.name()
+
+
+def _indicator_icon_path(kind):
+    """White check mark / dot PNGs drawn on top of the accent-coloured indicators."""
+    _spin_arrow_path("up")           # makes sure the icon folder exists
+    path = os.path.join(_SPIN_ICON_DIR, f"indicator_{kind}.png")
+    if not os.path.exists(path):
+        pm = QPixmap(16, 16)
+        pm.fill(Qt.transparent)
+        pt = QPainter(pm)
+        pt.setRenderHint(QPainter.Antialiasing, True)
+        if kind == "check":
+            pen = QPen(QColor("#ffffff"), 2.0)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            pt.setPen(pen)
+            pt.drawPolyline([QPointF(4, 8.5), QPointF(7, 11.5), QPointF(12, 4.8)])
+        else:
+            pt.setPen(Qt.NoPen)
+            pt.setBrush(QColor("#ffffff"))
+            pt.drawEllipse(QPointF(8, 8), 3.0, 3.0)
+        pt.end()
+        pm.save(path, "PNG")
+    return path.replace("\\", "/")
+
+
 def _reset_icon_path(color="#d0d0d0"):
     """Curved 'reset' arrow PNG for the reset-to-default buttons."""
     _spin_arrow_path("up", color)    # makes sure the icon folder exists
@@ -5058,10 +5156,13 @@ def _reset_icon_path(color="#d0d0d0"):
     return path
 
 
-def dark_spinbox_stylesheet(accent="#0078d4"):
+def dark_spinbox_stylesheet(accent=DEFAULT_ACCENT):
     """Dark-grey look for QSpinBox (field, hover/focus border, arrow buttons)."""
     up = _spin_arrow_path("up")
     down = _spin_arrow_path("down")
+    chk = _indicator_icon_path("check")
+    dot = _indicator_icon_path("dot")
+    accent_hover = QColor(accent).lighter(120).name()
     return f"""
         QSpinBox {{
             background-color: #3a3a3a; color: #e6e6e6;
@@ -5084,6 +5185,70 @@ def dark_spinbox_stylesheet(accent="#0078d4"):
         }}
         QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background-color: #5a5a5a; }}
         QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{ background-color: #2f2f2f; }}
+        QLineEdit, QPlainTextEdit, QTextEdit, QListWidget {{
+            background-color: #3a3a3a; color: #e6e6e6;
+            border: 1px solid #4d4d4d; border-radius: 4px;
+            padding: 3px 6px;
+            selection-background-color: #5a5a5a; selection-color: #ffffff;
+        }}
+        QLineEdit {{ min-height: 20px; }}
+        QLineEdit:hover, QPlainTextEdit:hover, QTextEdit:hover, QListWidget:hover {{ border-color: #6a6a6a; }}
+        QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QListWidget:focus {{ border-color: {accent}; }}
+        QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled {{ background-color: #333333; color: #777777; }}
+        QListWidget::item {{ padding: 2px 4px; border-radius: 3px; }}
+        QListWidget::item:hover {{ background-color: #474747; }}
+        QListWidget::item:selected {{ background-color: #5a5a5a; color: #ffffff; }}
+        QComboBox {{
+            background-color: #3a3a3a; color: #e6e6e6;
+            border: 1px solid #4d4d4d; border-radius: 4px;
+            padding: 2px 6px; min-height: 22px;
+        }}
+        QComboBox:hover {{ border-color: #6a6a6a; }}
+        QComboBox:focus, QComboBox:on {{ border-color: {accent}; }}
+        QComboBox::drop-down {{
+            subcontrol-origin: padding; subcontrol-position: center right;
+            width: 22px; border-left: 1px solid #4d4d4d;
+            border-top-right-radius: 3px; border-bottom-right-radius: 3px;
+            background-color: #474747;
+        }}
+        QComboBox::drop-down:hover {{ background-color: #5a5a5a; }}
+        QComboBox::down-arrow {{ image: url({down}); width: 10px; height: 10px; }}
+        QComboBox QAbstractItemView {{
+            background-color: #3a3a3a; color: #e6e6e6;
+            border: 1px solid #4d4d4d; outline: 0;
+            selection-background-color: #5a5a5a; selection-color: #ffffff;
+        }}
+        QCheckBox::indicator, QRadioButton::indicator {{
+            width: 16px; height: 16px;
+            border: 1px solid #5a5a5a; background-color: #3a3a3a;
+        }}
+        QCheckBox::indicator {{ border-radius: 4px; }}
+        QRadioButton::indicator {{ border-radius: 9px; }}
+        QCheckBox::indicator:hover, QRadioButton::indicator:hover {{ border-color: #8a8a8a; }}
+        QCheckBox::indicator:checked {{
+            background-color: {accent}; border-color: {accent}; image: url({chk});
+        }}
+        QRadioButton::indicator:checked {{
+            background-color: {accent}; border-color: {accent}; image: url({dot});
+        }}
+        QCheckBox::indicator:checked:hover, QRadioButton::indicator:checked:hover {{
+            background-color: {accent_hover}; border-color: {accent_hover};
+        }}
+        QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+            background-color: #333333; border-color: #444444;
+        }}
+        QPushButton {{
+            background-color: #3a3a3a; color: #e6e6e6;
+            border: 1px solid #4d4d4d; border-radius: 4px;
+            padding: 3px 14px; min-height: 22px;
+        }}
+        QPushButton:hover {{ background-color: #4a4a4a; border-color: #6a6a6a; }}
+        QPushButton:pressed {{ background-color: #2f2f2f; }}
+        QPushButton:default {{ border-color: {accent}; }}
+        QPushButton:focus {{ border-color: {accent}; }}
+        QPushButton:disabled {{ background-color: #333333; color: #777777; border-color: #404040; }}
+        QPushButton#colorSwatch {{ padding: 0px; min-height: 22px; }}
+        QPushButton#colorSwatch:hover {{ border-color: #9a9a9a; }}
         QToolButton#resetButton {{
             background-color: #3a3a3a; border: 1px solid #4d4d4d; border-radius: 4px;
         }}
@@ -5094,28 +5259,43 @@ def dark_spinbox_stylesheet(accent="#0078d4"):
     """
 
 
+def apply_dark_dialog_style(dialog, parent=None):
+    """Give a dialog the dark-grey button / spin-box look. The accent colour
+    follows the app's active-tab bar colour when the parent window has one."""
+    accent = DEFAULT_ACCENT
+    parent_settings = getattr(parent, "settings", None)
+    if isinstance(parent_settings, dict):
+        accent = parent_settings.get("accent_color", accent)
+    dialog.setStyleSheet(dark_spinbox_stylesheet(accent))
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.setWindowIcon(get_app_icon())
         self.settings = settings.copy()
         self.setWindowTitle("Style Configuration - MPad++")
-        self.setStyleSheet(dark_spinbox_stylesheet(self.settings.get("tab_active_bar_color", "#0078d4")))
-        self.setMinimumWidth(450)
+        self.setStyleSheet(dark_spinbox_stylesheet(self.settings.get("accent_color", DEFAULT_ACCENT)))
+        self.setMinimumWidth(700)
         self.setMinimumHeight(500)
+        self.resize(740, 720)
         
         main_layout = QVBoxLayout(self)
         
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_content = QWidget()
+        self._section_labels = []
         layout = QFormLayout(scroll_content)
         
         self.color_buttons = {}
         self.size_spins = {}
         self.hu_line_spins = {}
 
-        self.add_section_header(layout, "Editor", first=True)
+        self.add_section_header(layout, "Guiding Color", first=True)
+        self.add_color_picker(layout, "Accent color", "accent_color")
+        self.add_section_header(layout, "Editor")
         self.add_color_picker(layout, "App Background", "app_bg")
         self.add_color_picker(layout, "Editor Background", "editor_bg")
         self.add_color_picker(layout, "Normal Text", "editor_text")
@@ -5206,10 +5386,22 @@ class SettingsDialog(QDialog):
         
         self.setLayout(main_layout)
 
+    def _section_label_css(self):
+        accent = self.settings.get("accent_color", DEFAULT_ACCENT)
+        return (f"QLabel {{ color: {accent_text_color(accent)}; font-weight: bold; font-size: 9pt;"
+                f" letter-spacing: 1.5px; padding-left: 8px;"
+                f" border-left: 3px solid {accent}; background: transparent; }}")
+
+    def _apply_accent_live(self):
+        """Re-skin this dialog right away when the guiding colour is changed."""
+        accent = self.settings.get("accent_color", DEFAULT_ACCENT)
+        self.setStyleSheet(dark_spinbox_stylesheet(accent))
+        for label in self._section_labels:
+            label.setStyleSheet(self._section_label_css())
+
     def add_section_header(self, layout, title, first=False):
         """A styled group title spanning the whole row: accent bar on the left,
         bold spaced-out capitals and a thin separator line underneath."""
-        accent = self.settings.get("tab_active_bar_color", "#0078d4")
         holder = QWidget()
         holder.setObjectName("sectionHeaderHolder")
         holder.setStyleSheet("#sectionHeaderHolder { background: transparent; }")
@@ -5217,10 +5409,8 @@ class SettingsDialog(QDialog):
         hl.setContentsMargins(0, 4 if first else 16, 0, 4)
         hl.setSpacing(4)
         label = QLabel(title.upper())
-        label.setStyleSheet(
-            f"QLabel {{ color: {accent}; font-weight: bold; font-size: 9pt;"
-            f" letter-spacing: 1.5px; padding-left: 8px;"
-            f" border-left: 3px solid {accent}; background: transparent; }}")
+        label.setStyleSheet(self._section_label_css())
+        self._section_labels.append(label)
         line = QFrame()
         line.setFixedHeight(1)
         line.setStyleSheet("QFrame { background-color: rgba(128, 128, 128, 70); border: none; }")
@@ -5230,6 +5420,7 @@ class SettingsDialog(QDialog):
 
     def add_color_picker(self, layout, label_text, color_key):
         btn = QPushButton()
+        btn.setObjectName("colorSwatch")
         btn.setFixedWidth(100)
         btn.setStyleSheet(f"background-color: {self.settings[color_key]};")
         btn.clicked.connect(lambda _, k=color_key, b=btn: self.pick_color(k, b))
@@ -5266,6 +5457,7 @@ class SettingsDialog(QDialog):
 
     def add_format_setting(self, layout, label_text, color_key, size_key=None, max_size=72):
         btn = QPushButton()
+        btn.setObjectName("colorSwatch")
         btn.setFixedWidth(100)
         btn.setStyleSheet(f"background-color: {self.settings[color_key]};")
         btn.clicked.connect(lambda _, k=color_key, b=btn: self.pick_color(k, b))
@@ -5303,6 +5495,13 @@ class SettingsDialog(QDialog):
         if color.isValid():
             self.settings[key] = color.name()
             btn.setStyleSheet(f"background-color: {color.name()};")
+            if key == "accent_color":
+                # the guiding colour also drives the active tab bar
+                self.settings["tab_active_bar_color"] = color.name()
+                tab_btn = self.color_buttons.get("tab_active_bar_color")
+                if tab_btn is not None:
+                    tab_btn.setStyleSheet(f"background-color: {color.name()};")
+                self._apply_accent_live()
 
     def choose_font(self):
         dialog = QFontDialog(self)
@@ -5345,7 +5544,7 @@ class PreferencesDialog(QDialog):
         self.setWindowIcon(get_app_icon())
         self.settings = settings.copy()
         self.setWindowTitle("Preferences - MPad++")
-        self.setStyleSheet(dark_spinbox_stylesheet(self.settings.get("tab_active_bar_color", "#0078d4")))
+        self.setStyleSheet(dark_spinbox_stylesheet(self.settings.get("accent_color", DEFAULT_ACCENT)))
         self.setMinimumWidth(400)
 
         outer_layout = QVBoxLayout(self)
@@ -5568,6 +5767,7 @@ class LinkDialog(QDialog):
         super().__init__(parent)
         self.setWindowIcon(get_app_icon())
         self.setWindowTitle("Hyperlink - MPad++")
+        apply_dark_dialog_style(self, parent)
         # Wide and tall enough that a normal (or long) URL/display text is
         # fully visible - wrapped across a couple of lines - instead of
         # being scrolled/clipped inside a single-line field.
@@ -5668,6 +5868,7 @@ class MediaDialog(QDialog):
         super().__init__(parent)
         self.setWindowIcon(get_app_icon())
         self.setWindowTitle("Multimedia - MPad++")
+        apply_dark_dialog_style(self, parent)
         self.setMinimumWidth(640)
         self.setMinimumHeight(360)
         self.resize(680, 400)
@@ -5757,6 +5958,7 @@ class TableDialog(QDialog):
         super().__init__(parent)
         self.setWindowIcon(get_app_icon())
         self.setWindowTitle("Insert Table - MPad++")
+        apply_dark_dialog_style(self, parent)
         layout = QFormLayout(self)
 
         self.rows_spin = QSpinBox()
@@ -5785,6 +5987,7 @@ class FindReplaceDialog(QDialog):
         self.setWindowIcon(get_app_icon())
         self.main_window = main_window
         self.setWindowTitle("Find & Replace - MPad++")
+        apply_dark_dialog_style(self, main_window)
         self.setMinimumWidth(380)
         # Non-modal "tool" style: stays on top of the editor without
         # blocking interaction with it, like the find bar in most editors.
@@ -6087,6 +6290,18 @@ class MainWindow(QMainWindow):
                     saved_settings = json.load(f)
                     defaults = DEFAULT_SETTINGS.copy()
                     defaults.update(saved_settings)
+                    # Old blue defaults -> new teal ones (only colours the user never changed).
+                    for key in ("h1", "h2", "h3", "h4", "h5", "h6", "h1u", "h2u",
+                                "link", "tab_active_bar_color", "table_header_bg"):
+                        value = str(defaults.get(key, "")).lower()
+                        if value in OLD_BLUE_TO_TEAL:
+                            defaults[key] = OLD_BLUE_TO_TEAL[value]
+                    # Old grey default of the underlined-heading line -> now the
+                    # heading's text colour (only if the user never changed it).
+                    for lvl in (1, 2):
+                        lk = f"h{lvl}u_line_color"
+                        if str(defaults.get(lk, "")).lower() == "#3d444d":
+                            defaults[lk] = defaults.get(f"h{lvl}u", DEFAULT_SETTINGS[lk])
                     return defaults
             except Exception:
                 pass
@@ -6111,7 +6326,7 @@ class MainWindow(QMainWindow):
             QToolBar {{ background-color: {self.settings['app_bg']}; border: none; spacing: 2px; }}
             QToolButton {{ background-color: #3e3e42; color: {self.settings['app_text']}; border: 1px solid #555; padding: 5px; border-radius: 3px; }}
             QToolButton:hover {{ background-color: #505050; }}
-            QToolButton:checked {{ background-color: #007acc; border: 1px solid #007acc; }}
+            QToolButton:checked {{ background-color: {self.settings.get('accent_color', DEFAULT_ACCENT)}; border: 1px solid {self.settings.get('accent_color', DEFAULT_ACCENT)}; }}
             QStatusBar {{ background-color: #2d2d2d; color: #ccc; }}
             QMenuBar {{ background-color: {self.settings['app_bg']}; color: {self.settings['app_text']}; }}
             QMenuBar::item:selected {{ background-color: #505050; }}
@@ -7240,6 +7455,7 @@ class MainWindow(QMainWindow):
         
         dialog = QDialog(self)
         dialog.setWindowTitle("Edit Table")
+        apply_dark_dialog_style(dialog, self)
         layout = QVBoxLayout(dialog)
         
         btn_add_row = QPushButton("Add row below cursor")
