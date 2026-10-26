@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QFrame, QMainWindow, QTextEdit, QVB
                                QRadioButton, QButtonGroup, QListWidget, QListWidgetItem,
                                QComboBox, QToolTip, QInputDialog)
 from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListFormat,
-                           QKeySequence, QShortcut, QFont, QFontMetrics, QPalette,
+                           QKeySequence, QShortcut, QFont, QFontMetrics, QFontMetricsF, QPalette,
                            QAction, QActionGroup, QTextCursor, QDragEnterEvent, QDropEvent, 
                            QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon, QPixmap,
                            QSyntaxHighlighter, QTextTableFormat, QTextLength, QTextFrameFormat,
@@ -258,6 +258,8 @@ HR_PROP = QTextFormat.UserProperty + 4
 CODE_PAD_PROP = QTextFormat.UserProperty + 7
 CODE_PAD_X = 10          # left padding (px)
 CODE_PAD_Y = 6           # top padding of the first line / bottom padding of the last line (px)
+CODE_GAP_MIN = 8         # minimum free space OUTSIDE the box, between it and a neighbouring non-code line (px)
+CODE_GAP_SCALE = 0.35    # ...or this fraction of the neighbour's line height, whichever is larger (big headings get more room)
 CODE_PAD_RIGHT = 30      # right margin: keeps text (it wraps there) clear of the "Copy" button
 
 # --- Embedded media (images / gifs / video / audio) ---
@@ -2688,6 +2690,29 @@ class Editor(QTextEdit):
         f = b.blockFormat()
         return f.hasProperty(BLOCK_CODE_PROP) and f.property(BLOCK_CODE_PROP) == True
 
+    @staticmethod
+    def _code_gap_next_to(neighbour, use_last_fragment):
+        """Free space (px) to leave between a code box and the non-code line
+        `neighbour` next to it. Scales with that line's font so a tall heading
+        gets as much clearance as its taller line needs; 0 at the document
+        edge (no neighbour)."""
+        if neighbour is None or not neighbour.isValid():
+            return 0
+        font = neighbour.charFormat().font()
+        it = neighbour.begin()
+        frag = None
+        while not it.atEnd():
+            f = it.fragment()
+            if f.isValid():
+                frag = f
+                if not use_last_fragment:
+                    break
+            it += 1
+        if frag is not None:
+            font = frag.charFormat().font()
+        height = QFontMetricsF(font).height()
+        return int(round(max(CODE_GAP_MIN, height * CODE_GAP_SCALE)))
+
     def _on_code_pad_contents_change(self, position, removed, added):
         """Remember which part of the document changed; the margins of the code
         blocks around it are fixed up once the current edit has finished."""
@@ -2723,8 +2748,20 @@ class Editor(QTextEdit):
         while b.isValid():
             fmt = b.blockFormat()
             if self._block_is_code(b):
-                top = 0 if self._block_is_code(b.previous()) else CODE_PAD_Y
-                bottom = 0 if self._block_is_code(b.next()) else CODE_PAD_Y
+                # Padding inside the box + clear space outside it, so the box
+                # never touches/overlaps the line above or below (margins of
+                # neighbouring blocks collapse to the larger one in Qt, so the
+                # outer gap has to live in this block's own margin).
+                if self._block_is_code(b.previous()):
+                    top = 0
+                else:
+                    prev_b = b.previous() if b.previous().isValid() else None
+                    top = CODE_PAD_Y + self._code_gap_next_to(prev_b, True)
+                if self._block_is_code(b.next()):
+                    bottom = 0
+                else:
+                    next_b = b.next() if b.next().isValid() else None
+                    bottom = CODE_PAD_Y + self._code_gap_next_to(next_b, False)
                 want = (CODE_PAD_X, CODE_PAD_RIGHT, top, bottom)
                 have = (fmt.leftMargin(), fmt.rightMargin(), fmt.topMargin(), fmt.bottomMargin())
                 if want != have or not fmt.hasProperty(CODE_PAD_PROP):
@@ -2954,8 +2991,10 @@ class Editor(QTextEdit):
                 _blk = _blk.next()
             _r1 = doc_layout.blockBoundingRect(_first)
             _r2 = doc_layout.blockBoundingRect(_last)
-            _top = _r1.top() - _first.blockFormat().topMargin() - _scroll_y
-            _bottom = _r2.bottom() + _last.blockFormat().bottomMargin() - _scroll_y
+            # Only the inner padding is part of the box; the rest of the
+            # margin is the free gap to the neighbouring lines.
+            _top = _r1.top() - CODE_PAD_Y - _scroll_y
+            _bottom = _r2.bottom() + CODE_PAD_Y - _scroll_y
             _left = _r1.left() - _scroll_x
             _right -= _scroll_x
             if _bottom >= 0 and _top <= _view_h:
