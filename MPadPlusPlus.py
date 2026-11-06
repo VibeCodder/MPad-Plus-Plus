@@ -20,10 +20,10 @@ from PySide6.QtGui import (QColor, QTextCharFormat, QTextBlockFormat, QTextListF
                            QAction, QActionGroup, QTextCursor, QDragEnterEvent, QDropEvent, 
                            QTextDocument, QBrush, QPainter, QTextFormat, QPen, QIcon, QPixmap,
                            QSyntaxHighlighter, QTextTableFormat, QTextLength, QTextFrameFormat,
-                           QDesktopServices, QPyTextObject, QMovie, QImage)
+                           QDesktopServices, QPyTextObject, QMovie, QImage, QCursor)
 from PySide6.QtCore import (QRegularExpression, Qt, QFileInfo, QPoint, QSize, QSizeF, QRect, QRectF,
                             QTimer, QObject, QThread, Signal, QUrl, QBuffer, QPointF, QByteArray, QIODevice,
-                            QMimeData)
+                            QMimeData, QEvent)
 
 try:
     from PySide6.QtSvg import QSvgRenderer
@@ -271,6 +271,14 @@ CODE_PAD_RIGHT = 30      # right margin: keeps text (it wraps there) clear of th
 MEDIA_TYPE_PROP = QTextFormat.UserProperty + 10   # "image" | "gif" | "video" | "audio"
 MEDIA_SRC_PROP = QTextFormat.UserProperty + 11    # the path/URL exactly as written in the source
 MEDIA_ALT_PROP = QTextFormat.UserProperty + 12    # the "alt" display text between the [ ]
+MEDIA_COPY_BTN_SIZE = 28
+MEDIA_COPY_BTN_MARGIN = 8
+MEDIA_COPY_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
+    'fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>'
+    '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+)
 MEDIA_ID_PROP = QTextFormat.UserProperty + 13     # unique id, used to look up the live player/movie
 MEDIA_SCALE_PROP = QTextFormat.UserProperty + 14  # float, display-size multiplier set from the "Settings" > resize menu (default 1.0)
 MEDIA_OBJECT_TYPE = QTextFormat.UserObject + 1
@@ -437,6 +445,11 @@ TOOLBAR_SVG_ICONS = {
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
           <path fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"
                 d="M5.5 5.5 14.5 14.5 M14.5 5.5 5.5 14.5"/>
+        </svg>""",
+    "plus": """
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+          <path fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"
+                d="M10 4.5 10 15.5 M4.5 10 15.5 10"/>
         </svg>""",
     "media": """
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
@@ -2541,6 +2554,9 @@ class Editor(QTextEdit):
         self._media_controllers = {}       # media_id -> MediaPlayerController
         self._media_download_threads = {}  # src -> _MediaDownloadThread (kept alive)
         self._media_download_kind = {}     # src -> "image" | "gif"
+        self._media_hover_id = None        # media_id of the image/gif under the mouse
+        self._media_copy_btn_hover = False # mouse is over that image's copy button
+        self._media_copy_svg_renderer = None
 
         # --- Custom cursor rendering ---
         # Qt's built-in text cursor (driven by QWidgetTextControl's internal
@@ -2613,6 +2629,7 @@ class Editor(QTextEdit):
         self.update_line_number_area_width()
         self.highlight_current_line()
         self.setMouseTracking(True)
+        self.verticalScrollBar().valueChanged.connect(self._refresh_media_hover)
 
         # --- Spell checking ---
         self.spell_highlighter = SpellCheckHighlighter(self.document(), self)
@@ -3253,9 +3270,13 @@ class Editor(QTextEdit):
         self._code_copy_hover_pos = pos
         hovered_icon = any(rect.contains(pos) for rect, _, _ in self._code_copy_icon_rects)
         media_hit = self._media_object_at(pos)
+        self._set_media_hover(media_hit, pos)
+        over_copy_btn = self._media_copy_btn_hover
         if hovered_icon:
             self.viewport().setCursor(Qt.PointingHandCursor)
             self.viewport().update()
+        elif over_copy_btn:
+            self.viewport().setCursor(Qt.PointingHandCursor)
         elif media_hit is not None and media_hit[0].property(MEDIA_TYPE_PROP) in ("video", "audio"):
             self.viewport().setCursor(Qt.PointingHandCursor)
         elif self.anchorAt(pos):
@@ -3278,12 +3299,94 @@ class Editor(QTextEdit):
             media_hit = self._media_object_at(pos)
             if media_hit is not None:
                 fmt, rect, _obj_pos = media_hit
+                if (fmt.property(MEDIA_TYPE_PROP) in ("image", "gif")
+                        and self._media_copy_btn_rect(rect).contains(pos)):
+                    if self._copy_media_image(fmt):
+                        QToolTip.showText(event.globalPosition().toPoint(), "Skopiowano!",
+                                          self, self._media_copy_btn_rect(rect), 1200)
+                    return  # don't let this click move the text cursor / select
                 if self._handle_media_click(fmt, rect, pos):
                     return  # click was consumed by the play/pause control
             anchor = self.anchorAt(pos)
             if anchor:
                 open_hyperlink(anchor, self.get_media_base_dir())
         super().mousePressEvent(event)
+
+    # --- Embedded image/gif: hover "copy" button (top-right corner) ---
+
+    def _media_copy_btn_rect(self, media_rect):
+        """Copy button rect for an image whose on-screen rect is `media_rect`
+        (works in any coordinate space - viewport or painter - since it is
+        derived purely from the rect passed in)."""
+        size = MEDIA_COPY_BTN_SIZE
+        margin = MEDIA_COPY_BTN_MARGIN
+        mr = QRect(int(media_rect.left()), int(media_rect.top()),
+                   int(media_rect.width()), int(media_rect.height()))
+        size = min(size, max(12, min(mr.width(), mr.height()) - 2))
+        return QRect(mr.right() - size - margin + 1, mr.top() + margin, size, size)
+
+    def _set_media_hover(self, media_hit, pos):
+        """Track which image/gif (if any) is hovered and whether the mouse is
+        over its copy button; repaint only when that state changes."""
+        new_id = None
+        btn_hover = False
+        if media_hit is not None:
+            fmt, rect, _obj_pos = media_hit
+            if fmt.property(MEDIA_TYPE_PROP) in ("image", "gif"):
+                new_id = fmt.property(MEDIA_ID_PROP) or None
+                if new_id is not None:
+                    btn_hover = self._media_copy_btn_rect(rect).contains(pos)
+        if new_id != self._media_hover_id or btn_hover != self._media_copy_btn_hover:
+            self._media_hover_id = new_id
+            self._media_copy_btn_hover = btn_hover
+            self.viewport().update()
+
+    def _refresh_media_hover(self, *_args):
+        pos = self.viewport().mapFromGlobal(QCursor.pos())
+        if self.viewport().rect().contains(pos):
+            self._set_media_hover(self._media_object_at(pos), pos)
+        else:
+            self._set_media_hover(None, pos)
+
+    def viewportEvent(self, event):
+        if event.type() == QEvent.Leave:
+            self._set_media_hover(None, QPoint(-1, -1))
+        return super().viewportEvent(event)
+
+    def _copy_media_image(self, fmt):
+        """Copy the full-resolution image (or the current gif frame) to the
+        system clipboard."""
+        src = fmt.property(MEDIA_SRC_PROP) or ""
+        resolved, is_remote = resolve_media_path(src, self.get_media_base_dir())
+        if fmt.property(MEDIA_TYPE_PROP) == "gif":
+            movie = self.get_media_movie(src, resolved, is_remote)
+            pix = movie.currentPixmap() if movie else None
+        else:
+            pix = self.get_media_pixmap(src, resolved, is_remote)
+        if pix is None or pix.isNull():
+            return False
+        QApplication.clipboard().setPixmap(pix)
+        return True
+
+    def _draw_media_copy_button(self, painter, rect):
+        btn = self._media_copy_btn_rect(rect)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 190 if self._media_copy_btn_hover else 140))
+        painter.drawRoundedRect(btn, 6, 6)
+        pad = max(3, btn.width() // 5)
+        icon_rect = QRectF(btn.adjusted(pad, pad, -pad, -pad))
+        if QSvgRenderer is not None:
+            if self._media_copy_svg_renderer is None:
+                self._media_copy_svg_renderer = QSvgRenderer(QByteArray(MEDIA_COPY_SVG.encode("utf-8")))
+            self._media_copy_svg_renderer.render(painter, icon_rect)
+        else:
+            # Fallback when QtSvg is unavailable: the same two-rectangle glyph.
+            painter.setPen(QPen(QColor("#ffffff"), 1.5))
+            painter.setBrush(Qt.NoBrush)
+            w = icon_rect.width() * 0.62
+            painter.drawRoundedRect(QRectF(icon_rect.left(), icon_rect.top(), w, w), 2, 2)
+            painter.drawRoundedRect(QRectF(icon_rect.right() - w, icon_rect.bottom() - w, w, w), 2, 2)
 
     def _media_object_at(self, pos):
         """Hit-test a viewport point against embedded media objects. Returns
@@ -3551,6 +3654,8 @@ class Editor(QTextEdit):
         try:
             if media_type in ("image", "gif"):
                 self._draw_media_image(painter, rect, src, resolved, is_remote, media_type, alt)
+                if media_id and media_id == self._media_hover_id:
+                    self._draw_media_copy_button(painter, rect)
             elif media_type == "video":
                 self._draw_media_video(painter, rect, media_id, resolved, is_remote, alt)
             elif media_type == "audio":
@@ -5028,9 +5133,126 @@ class Editor(QTextEdit):
                 # styling pass should override.
 
 
+class EditorTabBar(QTabBar):
+    """Tab bar carrying its own themed '+' (new tab) button.
+
+    The button is a child of the bar and is re-positioned every time the
+    tab layout changes (tab added/removed/moved/resized, window resized,
+    a tab being dragged), so it always sits right after the last tab. When
+    the tabs overflow and the scroll arrows appear, it stays pinned just
+    left of the arrows instead of disappearing off-screen."""
+    PLUS_SIZE = 26
+    PLUS_GAP = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pinned = False
+        self.setExpanding(False)     # extra width must not stretch the tabs
+        self.plus_btn = QToolButton(self)
+        self.plus_btn.setToolTip("New Tab")
+        self.plus_btn.setCursor(Qt.PointingHandCursor)
+        self.plus_btn.setFocusPolicy(Qt.NoFocus)
+        self.plus_btn.setAutoRaise(True)
+        self.plus_btn.setFixedSize(self.PLUS_SIZE, self.PLUS_SIZE)
+        self.plus_btn.setIconSize(QSize(14, 14))
+        self.tabMoved.connect(lambda *_: self.place_plus_button())
+        self.refresh_plus_button()
+        self.place_plus_button()
+
+    def refresh_plus_button(self):
+        """(Re)apply icon + style from the current theme settings."""
+        settings = getattr(self.window(), "settings", None) or {}
+        muted = "#888888"                                   # same as inactive tab text
+        bright = settings.get("app_text", "#d4d4d4")
+        accent = settings.get("accent_color", DEFAULT_ACCENT)
+        hover_bg = "#383838"                                # same as hovered tab
+        pressed_bg = settings.get("tab_active_bg", "#2d2d2d")
+        base_bg = settings.get("app_bg", "#1e1e1e") if self._pinned else "transparent"
+
+        icon = QIcon()
+        normal = make_svg_icon("plus", muted, size=28).pixmap(28, 28)
+        active = make_svg_icon("plus", bright, size=28).pixmap(28, 28)
+        if normal.isNull():
+            self.plus_btn.setText("+")
+        else:
+            self.plus_btn.setText("")
+            icon.addPixmap(normal, QIcon.Normal)
+            icon.addPixmap(active, QIcon.Active)
+        self.plus_btn.setIcon(icon)
+        self.plus_btn.setStyleSheet(
+            f"QToolButton {{ background: {base_bg}; border: none; border-radius: 4px;"
+            f" padding: 0px; color: {muted}; font-size: 16px; }}"
+            f"QToolButton:hover {{ background: {hover_bg}; color: {bright}; }}"
+            f"QToolButton:pressed {{ background: {pressed_bg};"
+            f" border-bottom: 2px solid {accent}; }}"
+        )
+
+    def place_plus_button(self):
+        btn = getattr(self, "plus_btn", None)
+        if btn is None:              # layout signal fired before __init__ finished
+            return
+        n = self.count()
+        if n:
+            last = self.tabRect(n - 1)
+            x = last.right() + 1 + self.PLUS_GAP
+            top, height = last.top(), last.height()
+        else:
+            x, top, height = self.PLUS_GAP, 0, self.height()
+
+        # Width taken by the scroll arrows (shown only when tabs overflow).
+        tab_buttons = set()
+        for i in range(n):
+            tab_buttons.add(self.tabButton(i, QTabBar.RightSide))
+            tab_buttons.add(self.tabButton(i, QTabBar.LeftSide))
+        reserve = sum(b.width() for b in self.findChildren(QToolButton)
+                      if b is not btn and b not in tab_buttons and not b.isHidden())
+
+        limit = max(0, self.width() - reserve - btn.width() - 2)
+        pinned = x > limit
+        x = max(0, min(x, limit))
+        y = top + (height - btn.height()) // 2 + 1
+        btn.move(x, y)
+        btn.raise_()
+        btn.show()
+        if pinned != self._pinned:
+            self._pinned = pinned
+            self.refresh_plus_button()
+
+    def sizeHint(self):
+        # QTabWidget sizes the bar to exactly fit its tabs, so make room
+        # for the "+" button after the last one.
+        sh = super().sizeHint()
+        sh.setWidth(sh.width() + self.PLUS_SIZE + 2 * self.PLUS_GAP)
+        return sh
+
+    def tabLayoutChange(self):
+        super().tabLayoutChange()
+        self.place_plus_button()
+        QTimer.singleShot(0, self.place_plus_button)   # after scroll arrows settle
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.place_plus_button()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.place_plus_button()
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        self.place_plus_button()
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self.place_plus_button()
+
+
 class EditorTabs(QTabWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._bar = EditorTabBar(self)
+        self.setTabBar(self._bar)
+        self._bar.setExpanding(False)   # QTabWidget.setTabBar() turns expanding back on
         # Qt's built-in close-button subcontrol is disabled (see the
         # "image: none" rule in apply_app_theme) because styling its
         # default glyph reliably via QSS across platforms/styles isn't
@@ -5041,11 +5263,8 @@ class EditorTabs(QTabWidget):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
         
-        self.plus_btn = QToolButton(self)
-        self.plus_btn.setText("+")
-        self.plus_btn.setToolTip("New Tab")
-        self.plus_btn.setAutoRaise(True)
-        self.setCornerWidget(self.plus_btn, Qt.TopRightCorner)
+        # The "+" button lives inside the tab bar (right after the last tab).
+        self.plus_btn = self._bar.plus_btn
 
     def add_close_button(self, editor):
         """Create and attach a themed SVG 'x' close button for the tab
@@ -5074,6 +5293,8 @@ class EditorTabs(QTabWidget):
 
     def refresh_close_button_icons(self):
         """Re-tint every tab's close icon - call after the theme changes."""
+        self._bar.refresh_plus_button()
+        self._bar.place_plus_button()
         for i in range(self.count()):
             btn = self.tabBar().tabButton(i, QTabBar.RightSide)
             if btn is not None:
@@ -7810,54 +8031,68 @@ class MainWindow(QMainWindow):
         cursor.endEditBlock()
 
     def move_line(self, direction):
+        """Alt+Up / Alt+Down: swap the current line (block) with its neighbour.
+
+        The two adjacent blocks are removed and re-inserted in swapped order with
+        their own block/char formats set explicitly. (insertFragment into a
+        non-empty block merges block formats, which used to duplicate lines and
+        leak styles such as HR / setext / quote / code into neighbouring lines.)
+        """
         editor = self.get_editor()
         if not editor: return
         cursor = editor.textCursor()
         if cursor.currentTable(): return
-        cursor.beginEditBlock()
-        cursor.movePosition(QTextCursor.StartOfBlock)
-        start_pos = cursor.position()
-        orig_cursor = editor.textCursor()
-        rel_pos = orig_cursor.position() - start_pos
+        doc = editor.document()
+
         curr_block = cursor.block()
-        curr_fmt = curr_block.blockFormat()
-        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-        curr_frag = cursor.selection()
-        
-        if direction == 1:
-            next_block = curr_block.next()
-            if not next_block.isValid(): 
-                cursor.endEditBlock()
-                return
-            next_fmt = next_block.blockFormat()
-            cursor.setPosition(next_block.position())
-            cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-            next_frag = cursor.selection()
-            cursor.insertFragment(curr_frag)
-            cursor.setBlockFormat(curr_fmt)
-            cursor.setPosition(start_pos)
-            cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-            cursor.insertFragment(next_frag)
-            cursor.setBlockFormat(next_fmt)
-            cursor.setPosition(next_block.position() + rel_pos)
-        elif direction == -1:
-            prev_block = curr_block.previous()
-            if not prev_block.isValid(): 
-                cursor.endEditBlock()
-                return
-            prev_fmt = prev_block.blockFormat()
-            cursor.setPosition(prev_block.position())
-            cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-            prev_frag = cursor.selection()
-            cursor.insertFragment(curr_frag)
-            cursor.setBlockFormat(curr_fmt)
-            cursor.setPosition(start_pos)
-            cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-            cursor.insertFragment(prev_frag)
-            cursor.setBlockFormat(prev_fmt)
-            cursor.setPosition(prev_block.position() + rel_pos)
-        cursor.endEditBlock()
-        editor.setTextCursor(cursor)
+        other = curr_block.next() if direction == 1 else curr_block.previous()
+        if direction not in (1, -1) or not other.isValid():
+            return
+        # don't move lines in/out of table cells
+        if QTextCursor(other).currentTable():
+            return
+
+        first, second = (curr_block, other) if direction == 1 else (other, curr_block)
+        curr_is_first = (direction == 1)
+        rel_pos = min(cursor.position() - curr_block.position(), max(0, curr_block.length() - 1))
+
+        def grab(block):
+            c = QTextCursor(doc)
+            c.setPosition(block.position())
+            c.setPosition(block.position() + block.length() - 1, QTextCursor.KeepAnchor)
+            return c.selection(), block.blockFormat(), block.charFormat()
+
+        first_frag, first_bf, first_cf = grab(first)
+        second_frag, second_bf, second_cf = grab(second)
+        first_pos = first.position()
+        first_num = first.blockNumber()
+        second_pos = second.position()
+        second_len = second.length() - 1
+
+        edit = QTextCursor(doc)
+        edit.beginEditBlock()
+        # remove both lines' text and the separator between them -> one empty block remains
+        edit.setPosition(first_pos)
+        edit.setPosition(second_pos + second_len, QTextCursor.KeepAnchor)
+        edit.removeSelectedText()
+        # new top line = old second line
+        edit.setBlockFormat(second_bf)
+        edit.setBlockCharFormat(second_cf)
+        edit.insertFragment(second_frag)
+        edit.setBlockFormat(second_bf)
+        # new bottom line = old first line
+        edit.insertBlock(first_bf, first_cf)
+        edit.insertFragment(first_frag)
+        edit.setBlockFormat(first_bf)
+        edit.endEditBlock()
+
+        # put the caret back on the moved line, same column
+        target_num = first_num + (1 if curr_is_first else 0)
+        target = doc.findBlockByNumber(target_num)
+        new_cursor = QTextCursor(doc)
+        new_cursor.setPosition(target.position() + min(rel_pos, max(0, target.length() - 1)))
+        editor.setTextCursor(new_cursor)
+        editor.ensureCursorVisible()
 
     # --- Update toolbar state ---
     def update_toolbar_state(self):
